@@ -9,9 +9,9 @@
 Linux、Python 3.11、4 张支持 BF16 的 NVIDIA GPU；建议从官方使用的 A100/H100 级设备开始。以下安装 CUDA 12.4 的 PyTorch 2.6 wheel，需匹配宿主驱动：
 
 ```bash
-conda create -n minionerec-repro python=3.11 -y
-conda activate minionerec-repro
-python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+conda create -n minidiprec python=3.11 -y
+conda activate minidiprec
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 python -m pip install -r requirements-reproduction.txt
 
 bash scripts/reproduce.sh --run-name qwen3_h50_seed42 \
