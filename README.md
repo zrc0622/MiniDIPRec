@@ -1,3 +1,135 @@
+# MiniDIPRec：MiniOneRec 四卡复现
+
+本分支提供 `Qwen/Qwen3-0.6B`、最近最多 50 次交互、单机指定四卡的 **Office SFT → 评估 → RL → 评估 → Industrial 同一流程**。两个类别分别从原始 Qwen3 开始；RL 仅继承本类别通过验证集选择的 SFT 模型。方法以官方实际启用的 `sft.py` / `rl.py` 为准，不包含 GPR、TS-Rec 或新增推荐方法。
+
+当前已完成全量数据检查、真实 Qwen3 tokenizer 全任务长度扫描、小模型 SFT/RL/恢复、四进程 CPU 分布式检查。**本机没有 CUDA GPU，尚未执行 Qwen3-0.6B 完整训练、CUDA/ZeRO-2/bitsandbytes 路径、GPU 显存与吞吐检查，也没有 SFT/RL 最终指标。** 详细记录见 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md)。
+
+## 安装与一键运行
+
+Linux、Python 3.11、4 张支持 BF16 的 NVIDIA GPU；建议从官方使用的 A100/H100 级设备开始。以下安装 CUDA 12.4 的 PyTorch 2.6 wheel，需匹配宿主驱动：
+
+```bash
+conda create -n minionerec-repro python=3.11 -y
+conda activate minionerec-repro
+python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+python -m pip install -r requirements-reproduction.txt
+
+bash scripts/reproduce.sh --run-name qwen3_h50_seed42 \
+  --gpus 0,1,2,3 --model Qwen/Qwen3-0.6B \
+  --checkpoint-root /path/to/large_disk/minionerec_checkpoints
+```
+
+`--model /path/to/Qwen3-0.6B` 支持含完整原始模型和 tokenizer 的本地目录。下载源配置沿用 Hugging Face 环境变量；脚本不强制第三方镜像。`--gpus 4,5,6,7` 或四个 GPU UUID 均可；所有训练、评估子进程只看到这四卡，内部 local rank 为 0–3，不额外占用 vLLM GPU。
+
+执行顺序严格为 Office 全流程后 Industrial 全流程，所有阶段串行。SFT 使用 Transformers `Trainer` + DDP；RL 使用仓库原有 `ReReTrainer` + 官方 ZeRO-2 配置，保留 `paged_adamw_32bit`，没有换为其他 GRPO 实现。
+
+| 参数 | 官方运行配置 | 本复现 |
+|---|---|---|
+| SFT batch | 8 × 16 × 8 = 1024 | 4 × 4 × 64 = 1024 |
+| SFT 训练 | 10 epochs，LR 3e-4，AdamW，linear，warmup 20 | 保留；每 5% 验证/保存，patience 3 |
+| RL batch（候选数） | 8 × 64 × 2 = 1024 | 4 × 16 × 16 = 1024 |
+| RL 每次更新的 prompt 数 | 1024 / G16 = 64 | 64 |
+| RL 训练 | 2 epochs，LR 1e-5，cosine，warmup 3%，grad norm 0.3 | 保留 |
+| RL 奖励/生成 | exact + ranking，G=16，beam search，temperature 1 | 保留官方 beam sampling 配置 |
+| RL reference | beta .001，sync=True，alpha .6，每 512 step 同步 | 保留并保存同步后的 reference 以支持恢复 |
+
+SFT 全模型训练，保留 SID 历史→SID、SID↔title、SID 历史→title 任务；Fusion 的 description 分支原本未启用，保持关闭。RL 保留 SID 历史→SID、title/description→SID、随机抽取 10,000 条 title 历史→SID；抽样沿用官方 pandas `random_state=0`，整体 shuffle/训练 seed=42。保留 `add_gt=False`、`dynamic_sampling=False`、`test_during_training=False`、`dapo=False`、`gspo=False`。
+
+可用 `--sft-micro-batch 8 --rl-micro-batch 32` 适配显存，累积自动计算，仍保持 batch 1024；RL micro 必须为 16 的倍数，低于 16 会明确拒绝。每张卡的候选生成必须持有完整的 G=16 组。默认评估 batch 为 2，可通过 `--eval-batch-size` 调整。各 epoch 的不足整批尾部沿用官方 Trainer/Accelerate 行为，可能有补齐和不足完整累积更新；批大小等价指正常完整更新。
+
+## 单阶段与断点恢复
+
+所有阶段均通过相同入口，沿用同一 run-name、模型、四卡和 batch 参数：
+
+```bash
+# 无 GPU 也可以执行：恢复并检查两份数据，不覆盖官方文件
+bash scripts/reproduce.sh --run-name qwen3_h50_seed42 --stage prepare
+
+# 无 GPU 也可以执行：真实 tokenizer 扫描所有启用任务
+bash scripts/reproduce.sh --run-name qwen3_h50_seed42 --stage preflight
+
+# 仅 Office SFT；stage 还支持 eval-sft、rl、eval-rl、summary
+bash scripts/reproduce.sh --run-name qwen3_h50_seed42 \
+  --gpus 0,1,2,3 --dataset Office_Products --stage sft
+
+# 自动跳过已完成阶段；未完成的训练恢复最新完整 checkpoint
+bash scripts/reproduce.sh --run-name qwen3_h50_seed42 --gpus 0,1,2,3 --resume
+
+# 只生成完整顺序和命令，执行数据检查，不加载模型或启动训练
+bash scripts/reproduce.sh --run-name inspect_commands --gpus 0,1,2,3 --dry-run
+
+# 四卡 GPU 冒烟：独立目录，每个训练阶段只跑 2 次更新
+bash scripts/reproduce.sh --run-name gpu_smoke --gpus 0,1,2,3 --max-steps 2
+```
+
+上述单阶段示例使用默认 checkpoint-root；若一键命令使用了自定义 `--checkpoint-root` 或本地 `--model`，**每次继续运行时也传相同参数**。配置、数据指纹或实现变化会拒绝复用旧 run；正式实验不能沿用 `--max-steps` 冒烟 run。恢复包含模型、优化器、scheduler、随机状态、SFT early-stop 状态和 RL reference；RL 缺失 reference 的旧官方 checkpoint 会被拒绝作为续训状态。`selected_model` 是选出的模型导出，只供评估和下一阶段初始化；继续训练使用 `checkpoint-<step>`。
+
+## 历史恢复与必要修复
+
+官方处理程序按目标时间排序交互并切成 train/valid/test，每条 history 最多 10 条。新程序严格按三个原始文件的原始行序逐行重放：首次出现的用户必须有 1 条历史；每个后继 history 必须等于已恢复过去交互的末尾 `min(10, 已知长度)` 条。检查通过后，先输出目标之前最近最多 50 条，随后才把当前目标加入已知序列。断链、缺开头、乱序、缺 metadata、item/SID/title 不匹配立即报错，不尝试猜测或按 item ID 排序。保留行数、行序、目标、划分、SID；新增稳定 `sample_id`、`target_position` 用于审计。生成文件单独写到结果目录。
+
+这依赖官方 CSV 的时间排序导出契约；CSV 本身没有 timestamp，无法独立验证原始时间戳。在该契约下，较早的 valid/test 交互可成为更晚样本的已知历史，和官方连续窗口一致；当前目标和更晚交互不会进入自身历史，也不从 test 标签选模型。
+
+必要错误修复单独列出：
+
+1. RL 标签随样本行携带，奖励直接读取 `target`；重复 prompt/history 不再覆盖标签，不合并验证标签到训练字典。rank 内生成前检查 prompt、target、sample_id 的 G=16 分组，跨 rank reward gather 后保持相同切片顺序。
+2. 官方 item/title/description 字典会丢弃重复键。本流程按 item 生成对齐样本，保留相同文本对应不同 SID 的样本；SID 碰撞时 Fusion 的 title 根据原 item ID 获取。任务种类和奖励公式不变，修复会使对齐任务样本数略有增加。
+3. 官方 SFT 带 instruction 前缀，RL 缺少前缀，旧 eval 的推荐问法也不同。本流程以官方 SFT 模板统一推荐输入，item identification 沿用其官方模板；保留纯文本 `### User Input` / `### Response`，不套 Qwen3 chat/thinking 模板。
+4. 新增 SID token 按官方排序扩词表，同步 resize input embedding 与 output head。检查每个 SID token 的原子性、连接编码和完整 round-trip。统一输出为 `SID + 换行 + tokenizer EOS`；Qwen3 EOS/PAD 为 151645。约束树按生成部分计算 prefix，不硬编码模型名称、提示 token 数或 token ID。非法 prefix、缺 EOS、超长输入立即报错。
+5. 官方 RL 入口额外加载 `device_map=auto` 的模型；新入口只由 trainer 加载本 rank 的策略模型与 reference，使用 BF16。TRL generation context 恢复 gradient checkpointing 时会丢失 non-reentrant 设置，已在 backward 前恢复，四进程小模型验证通过。
+6. 为支持用户要求的验证选模，SFT 保留最低 validation loss；RL 以最高 validation ranking reward（exact + rank penalty 之和）选模。RL eval 间隔保留 .0999，save 从 .1 对齐到 .0999；修复 trainer 只把 eval_reward 写日志而不返回的问题，供最佳 checkpoint 选择使用。test 仅在已选择模型上最终评价。
+7. RL checkpoint 增加同步 reference 权重，修复 sampler 在恢复后无法复现对应 epoch 顺序的问题。模型保存仅由主 rank 写，训练日志和状态持续归档。W&B 改为本地记录。
+
+SID 映射本身存在碰撞：Office 3459 个 item / 3444 个 SID，Industrial 3686 / 3670。保留官方 SID 命中口径，预测同时写每个 SID 对应的完整 item ID 列表；不宣称模型能区分共享 SID 的 item。
+
+## 统一评估与产物
+
+SFT 和 SFT+RL 都用 full-catalog、deterministic beam=50、temperature=1、length_penalty=0，不剔除历史 item，不抽负例；输出 50 个唯一合法 SID。报告 HR/Recall@5、@10 和 NDCG@5、@10；每行一个目标，因此 HR=Recall。四个评估 rank 用原始行号步进切分，合并时检查每个样本恰好出现一次。
+
+token 上限来自全量任务扫描并向上取整到 128；本次 Office/Industrial 的 SFT 上限分别 512/384，RL prompt 都为 1792，SID completion 为 5。不会通过截断悄悄丢掉更早历史。运行仍会针对实际提供的 tokenizer 重新扫描，并记录配置。
+
+```text
+results/<run_name>/
+  run_config.json, invocations.jsonl, commands.sh, commands.jsonl, environment.log
+  source/, source_sha256.json
+  summary.csv, summary.json, summary.md
+  Office_Products/                        # Industrial 同结构
+    data/{train,valid,test}.csv, *.index.json, *.item.json, info.txt, audit.json
+    lengths.json, tokenizer/, preflight.log
+    sft/                                 # rl 同结构
+      train.log, metrics.jsonl, training_args.json, trainer_state.json, training.json
+      valid.predictions.jsonl, test.predictions.jsonl
+      valid.metrics.json, test.metrics.json, eval-valid.log, eval-test.log
+      *.complete.json
+<checkpoint-root>/<run_name>/<category>/{sft,rl}/
+  checkpoint-<step>/, selected_model/
+```
+
+`training.json` 记录父模型、选中 checkpoint 路径/step、训练终止 step 和验证选择依据。结果目录保存实际数据与源码副本，不使用外部软链接；复制结果目录即可分析。模型权重在 checkpoint-root 单独存储，只有重新推理或续训才需要拷贝它们。没有训练结果时 summary 明确为空，不生成虚构指标。
+
+一条打包命令（校验没有软链接或混入模型权重）：
+
+```bash
+python scripts/package_results.py qwen3_h50_seed42
+```
+
+输出 `results/qwen3_h50_seed42.tar.gz`。
+
+## 本地检查
+
+```bash
+python -m unittest tests.test_reproduction tests.test_reproduction_runtime -v
+# 可选：使用真实 Qwen3 tokenizer 跑 beam=50 小模型解码检查
+QWEN3_TOKENIZER=/path/to/Qwen3-0.6B python -m unittest tests.test_reproduction_runtime -v
+# CPU 四进程检查（使用小随机 Qwen3；不是正式 GPU 性能验证）
+OMP_NUM_THREADS=1 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 \
+  --master_port=29719 --module tests.reproduction_distributed_smoke
+```
+
+以下保留原仓库 README，原 `sft.sh` / `rl.sh` / `evaluate.sh` 是官方八卡示例；本复现请使用上面的 `scripts/reproduce.sh`。
+
+---
+
 <div align="center">
 
 

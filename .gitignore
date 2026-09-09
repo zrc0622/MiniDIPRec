@@ -1,0 +1,55 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# Generated experiment artifacts (including packaged results)
+/results/
+/checkpoints/
+/output/
+/output_dir/
+/outputs/
+/temp/
+/tmp/
+/logs/
+wandb/
+runs/
+*.log
+nohup.out
+
+# Downloaded weights and training state; keep rq/models/ source code tracked
+/local_models/
+checkpoint-*/
+final_checkpoint/
+selected_model/
+*.safetensors
+*.pt
+*.pth
+pytorch_model*.bin
+.cache/
+
+# Local task notes and prompts
+/prompt.md
+/task_plan.md
+/findings.md
+/progress.md
+/.planning/
+
+# Local credentials, editor and OS files
+.env
+.env.*
+!.env.example
+!.env.template
+.idea/
+.DS_Store
+._*
+*.swp
+*.swo
+*~

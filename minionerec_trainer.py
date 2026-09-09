@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
+from reproduction.contracts import SIDTrie, validate_groups
 import textwrap
 import warnings
 from collections import defaultdict
@@ -60,7 +62,6 @@ from transformers import (
         Trainer
     )
 
-from LogitProcessor import ConstrainedLogitsProcessor
 from transformers.generation import LogitsProcessor
 import math
 
@@ -102,11 +103,16 @@ class RepeatRandomSampler(Sampler):
         self.repeat_count = repeat_count
         self.num_samples = len(data_source)
         self.seed = seed
+        self.epoch = 0
         self.generator = torch.Generator()  # Create a local random generator
         if seed is not None:
             self.generator.manual_seed(seed)
 
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
     def __iter__(self):
+        self.generator.manual_seed((self.seed or 0) + self.epoch)
         indexes = [
             idx
             for idx in torch.randperm(self.num_samples, generator=self.generator).tolist()
@@ -344,7 +350,7 @@ class ReReTrainer(Trainer):
             return features
 
         # Training arguments
-        self.max_prompt_length = args.max_prompt_length
+        self.max_prompt_length = getattr(args, "max_prompt_length", None)
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         print(f"max_completion_length: {self.max_completion_length}")
         self.num_generations = args.num_generations  # = G in the GRPO paper 
@@ -409,6 +415,11 @@ class ReReTrainer(Trainer):
                     f"divisible by the number of generations per prompt ({self.num_generations}). Given the current "
                     f"eval batch size, the valid values for the number of generations are: {possible_values}."
                 )
+
+        if self.beam_search:
+            for name in ('per_device_train_batch_size', 'per_device_eval_batch_size'):
+                if getattr(args, name) % self.num_generations:
+                    raise ValueError(f'{name} must be divisible by G={self.num_generations}; beams are generated locally')
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
@@ -526,50 +537,11 @@ class ReReTrainer(Trainer):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
         
-        with open(self.info_file, 'r') as f:
-            info = f.readlines()
-            # Parse new format: semantic_id \t item_title \t item_id
-            semantic_ids = [line.split('\t')[0].strip() + "\n" for line in info]
-            item_titles = [line.split('\t')[1].strip() + "\n" for line in info if len(line.split('\t')) >= 2]
-            
-            # Format for tokenization
-            info_semantic = [f'''### Response:\n{_}''' for _ in semantic_ids]
-            info_titles = [f'''### Response:\n{_}''' for _ in item_titles]
-
-            info = info_semantic
-
-        # with open(self.info_file, 'r') as f:
-        #     info = f.readlines()
-        #     info = ["\"" + _[:-len(_.split('\t')[-1])].strip() + "\"\n" for _ in info]
-        #     info = [f'''### Response:\n{_}''' for _ in info]
-
-        tokenizer = AutoTokenizer.from_pretrained(self.base_model)
-        if self.base_model.lower().find("llama") > -1: 
-            prefixID = [tokenizer(_).input_ids[1:] for _ in info]
-        else:
-            prefixID = [tokenizer(_).input_ids for _ in info]
-        
-        if self.base_model.lower().find("gpt2") > -1:
-            prefix_index = 4
-        else:
-            prefix_index = 3
-            
-        self.hash_dict = dict()
-        # sasrec_dict = dict()
-        for index, ID in enumerate(prefixID):
-            ID.append(tokenizer.eos_token_id)
-            for i in range(prefix_index, len(ID)):
-                if i == prefix_index:
-                    hash_number = self.get_hash(ID[:i])
-                else:
-                    hash_number = self.get_hash(ID[prefix_index:i])
-                if hash_number not in self.hash_dict:
-                    self.hash_dict[hash_number] = set()
-                    # sasrec_dict[hash_number] = set()
-                self.hash_dict[hash_number].add(ID[i])
-
-        for key in self.hash_dict.keys():
-            self.hash_dict[key] = list(self.hash_dict[key])
+        with open(self.info_file) as f:
+            semantic_ids = [line.split('\t')[0].strip() for line in f]
+        self.sid_trie = SIDTrie(self.processing_class, semantic_ids)
+        if self.max_completion_length < self.sid_trie.max_new_tokens:
+            raise ValueError('Completion budget cannot contain SID + newline + EOS')
 
         self.test_generation_config = GenerationConfig(max_new_tokens=self.max_completion_length,
                                                             length_penalty=self.length_penalty,
@@ -581,23 +553,13 @@ class ReReTrainer(Trainer):
                                                             pad_token_id=self.processing_class.pad_token_id,
                                                             eos_token_id=self.processing_class.eos_token_id,)
 
-    def get_hash(self, x):
-            x = [str(_) for _ in x]
-            return '-'.join(x)
-
-    def prefix_allowed_tokens_fn(self, batch_id, input_ids):
-            hash_number = self.get_hash(input_ids)
-            if hash_number in self.hash_dict:
-                return self.hash_dict[hash_number]
-            return []
-    
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs.
         # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
         # Instead, we set them to the columns expected by the `training_step` method, hence the override.
         if self._signature_columns is None:
-            self._signature_columns = ["prompt"]
+            self._signature_columns = ["prompt", "completion", "target", "sample_id"]
 
     # def _get_train_sampler(self,  *args, **kwargs) -> Sampler:
     #     # Returns a sampler that ensures each prompt is repeated across multiple processes. This guarantees that
@@ -667,8 +629,7 @@ class ReReTrainer(Trainer):
         prompts = [x["prompt"] for x in inputs]
 
         if self.add_gt or self.test_during_training or self.dynamic_sampling:
-            histories = [self.prompt2history[x["prompt"]] for x in inputs]
-            targets = [self.history2target[x] for x in histories]
+            targets = [x.get("target", x.get("completion")) for x in inputs]
             # print(f"targets: {targets}")
             num_categories = len(set(targets)) 
         # target_ids = self.processing_class(targets, return_tensors="pt", padding=True, padding_side="left")["input_ids"]
@@ -682,20 +643,14 @@ class ReReTrainer(Trainer):
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         
-        if self.max_prompt_length is not None:
-            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
-            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
-
-        ccc = ConstrainedLogitsProcessor(
-                # guidance_scale=1.0,
-                # cf_logits=None,
-                prefix_allowed_tokens_fn=self.prefix_allowed_tokens_fn,
-                # cf_dict=sasrec_dict,
-                # unconditional_ids=None,
-                num_beams=self.num_generations if self.beam_search else 1,
-                base_model=self.base_model,
-                eos_token_id=self.processing_class.eos_token_id
-            )
+        if self.max_prompt_length is not None and prompt_ids.shape[1] > self.max_prompt_length:
+            raise ValueError(f'RL prompt has {prompt_ids.shape[1]} tokens; limit {self.max_prompt_length}; no truncation allowed')
+        if self.beam_search:
+            validate_groups([{'prompt': row['prompt'],
+                              'target': row.get('target', row.get('completion', '')),
+                              'sample_id': row.get('sample_id', row['prompt'] + row.get('completion', ''))}
+                             for row in inputs], self.num_generations)
+        ccc = self.sid_trie.processor(prompt_ids.shape[1])
         self.logits_processor = LogitsProcessorList([TemperatureLogitsWarper(temperature=self.temperature), ccc])
         self.test_lp_list = LogitsProcessorList([ccc])
 
@@ -882,7 +837,17 @@ class ReReTrainer(Trainer):
 
 
         # Mask everything after the first EOS token
+        # TRL's unwrap context re-enables checkpointing with default reentrant=True.
+        # Preserve the requested mode before the DDP backward pass (Qwen3 tied weights).
+        if self.args.gradient_checkpointing:
+            self.accelerator.unwrap_model(self.model).gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs=self.args.gradient_checkpointing_kwargs)
+
+        if completion_ids.shape[0] != len(inputs):
+            raise ValueError('Generated candidates no longer align with repeated input rows')
         is_eos = completion_ids == self.processing_class.eos_token_id
+        if not is_eos.any(dim=1).all():
+            raise ValueError('Completion reached token budget without EOS')
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
@@ -1089,11 +1054,51 @@ class ReReTrainer(Trainer):
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
 
         logs = {**logs, **metrics}
+        if "eval_reward" in logs:
+            self._last_eval_metrics = {k: v for k, v in logs.items() if k.startswith("eval_")}
         if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
             super().log(logs, start_time)
         else:  # transformers<=4.46
             super().log(logs)
         self._metrics.clear()
+
+    def evaluate(self, *args, **kwargs):
+        # Upstream log() added rewards only to logs, not evaluate()'s return value.
+        # Trainer's best-checkpoint selector reads the returned dict.
+        self._last_eval_metrics = {}
+        result = super().evaluate(*args, **kwargs)
+        result.update(self._last_eval_metrics)
+        return result
+
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)
+        if self.ref_model is not None and self.args.should_save:
+            checkpoint = Path(self._get_output_dir(trial)) / f'checkpoint-{self.state.global_step}'
+            ref = self.accelerator.unwrap_model(self.ref_model)
+            pending = checkpoint / 'reference_model.pt.tmp'
+            torch.save({k: v.detach().cpu() for k, v in ref.state_dict().items()}, pending)
+            pending.replace(checkpoint / 'reference_model.pt')
+        self.accelerator.wait_for_everyone()
+
+    def _load_reference_checkpoint(self, resume_from_checkpoint):
+        if self.ref_model is not None:
+            path = Path(resume_from_checkpoint) / 'reference_model.pt'
+            if not path.is_file():
+                raise ValueError(f'Missing reference state for exact RL resume: {path}')
+            self.accelerator.unwrap_model(self.ref_model).load_state_dict(
+                torch.load(path, map_location='cpu', weights_only=True), strict=True)
+
+    def train(self, resume_from_checkpoint=None, **kwargs):
+        # DeepSpeed resumes model/optimizer directly and bypasses _load_from_checkpoint.
+        if resume_from_checkpoint:
+            if not isinstance(resume_from_checkpoint, (str, os.PathLike)):
+                raise ValueError('Pass an explicit checkpoint path for RL resume')
+            self._load_reference_checkpoint(resume_from_checkpoint)
+        return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        self._load_reference_checkpoint(resume_from_checkpoint)
 
     def create_model_card(
         self,

@@ -1,3 +1,4 @@
+import ast
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -20,9 +21,9 @@ class Tokenizer:
     def encode(self, s: str, bos: bool, eos: bool) -> List[int]:
         assert type(s) is str
         t = self.tokenizer.encode(s)
-        while t[0] == self.bos_id:
+        while t and t[0] == self.bos_id:
             t = t[1:]
-        while t[-1] == self.eos_id:
+        while t and t[-1] == self.eos_id:
             t = t[:-1]
 
         if bos and self.bos_id is not None:
@@ -360,7 +361,7 @@ class SidDataset(CSVBaseDataset):
         self.get_inputs()  
 
     def get_history(self, row):
-        row['history_item_sid'] = eval(row['history_item_sid'])
+        row['history_item_sid'] = ast.literal_eval(row['history_item_sid'])
         L = len(row['history_item_sid']) 
         history = ""
         history_str = "::".join(row["history_item_sid"])
@@ -401,7 +402,7 @@ class SidSFTDataset(CSVBaseDataset):
         self.get_inputs()
 
     def get_history(self, row):
-        row['history_item_sid'] = eval(row['history_item_sid'])
+        row['history_item_sid'] = ast.literal_eval(row['history_item_sid'])
         L = len(row['history_item_sid']) 
         history = ""
         history_str = ", ".join(row["history_item_sid"])
@@ -456,8 +457,8 @@ Can you predict the next possible item that the user may expect?
         attention_mask = [1] * len(tokens)
         labels = [-100] * input_prompt_len + tokens[input_prompt_len:]
         
-        if len(tokens) >= self.max_len:
-            print(len(tokens))
+        if len(tokens) > self.max_len:
+            raise ValueError(f"{type(self).__name__} row {idx}: {len(tokens)} tokens exceed max_len={self.max_len}; increase the limit")
         
         return {
             "input_ids": tokens[-self.max_len:],
@@ -705,25 +706,14 @@ class SidItemFeatDataset(JSONBaseDataset):
                     self.sid2title[combined_sid] = title
                     self.title2sid[title] = combined_sid
         
-        # Create data samples
         self.data = []
-        
-        # Create sid2title samples
-        for sid, title in self.sid2title.items():
-            self.data.append({
-                'task': 'sid2title',
-                'input': sid,
-                'output': title
-            })
-        
-        # Create title2sid samples  
-        for title, sid in self.title2sid.items():
-            self.data.append({
-                'task': 'title2sid',
-                'input': title,
-                'output': sid
-            })
-        
+        for item_id, tokens in self.indices.items():
+            sid, title = ''.join(tokens), self.item_feat[item_id]['title']
+            self.data.append({'task': 'sid2title', 'input': sid, 'output': title})
+        for item_id, tokens in self.indices.items():
+            sid, title = ''.join(tokens), self.item_feat[item_id]['title']
+            self.data.append({'task': 'title2sid', 'input': title, 'output': sid})
+
         if sample > 0 and sample < len(self.data):
             self.data = random.sample(self.data, sample)
         
@@ -776,8 +766,8 @@ Answer the question about item identification.
         attention_mask = [1] * len(tokens)
         labels = [-100] * input_prompt_len + tokens[input_prompt_len:]
         
-        if len(tokens) >= self.max_len:
-            print(f"Sequence length {len(tokens)} exceeds max_len {self.max_len}")
+        if len(tokens) > self.max_len:
+            raise ValueError(f"{type(self).__name__} row {idx}: {len(tokens)} tokens exceed max_len={self.max_len}; increase the limit")
         
         return {
             "input_ids": tokens[-self.max_len:],
@@ -821,7 +811,7 @@ class RLTitle2SidDataset(JSONBaseDataset):
                 # Handle description format
                 if isinstance(description, str) and description.startswith("['") and description.endswith("']"):
                     try:
-                        desc_list = eval(description)
+                        desc_list = ast.literal_eval(description)
                         description = desc_list[0] if desc_list else description
                     except:
                         pass
@@ -834,25 +824,19 @@ class RLTitle2SidDataset(JSONBaseDataset):
                     self.sid2description[combined_sid] = description
                     self.description2sid[description] = combined_sid
         
-        # Create data samples
         self.data = []
-        
-        # Create title2sid samples  
-        for title, sid in self.title2sid.items():
-            self.data.append({
-                'task': 'title2sid',
-                'input': title,
-                'output': sid
-            })
-        
-        # Create description2sid samples
-        for description, sid in self.description2sid.items():
-            self.data.append({
-                'task': 'description2sid',
-                'input': description,
-                'output': sid
-            })
-        
+        for item_id, tokens in self.indices.items():
+            self.data.append({'task': 'title2sid', 'input': self.item_feat[item_id]['title'], 'output': ''.join(tokens)})
+        for item_id, tokens in self.indices.items():
+            description = self.item_feat[item_id]['description']
+            if isinstance(description, str) and description.startswith("['") and description.endswith("']"):
+                try:
+                    desc_list = ast.literal_eval(description)
+                    description = desc_list[0] if desc_list else description
+                except (ValueError, SyntaxError):
+                    pass  # Official fallback: preserve malformed list-like description verbatim.
+            self.data.append({'task': 'description2sid', 'input': description, 'output': ''.join(tokens)})
+
         if sample > 0 and sample < len(self.data):
             self.data = random.sample(self.data, sample)
         
@@ -912,7 +896,7 @@ class RLSeqTitle2SidDataset(CSVBaseDataset):
     
     def get_history(self, row):
         # Parse history_item_title field
-        history_item_title = eval(row['history_item_title'])
+        history_item_title = ast.literal_eval(row['history_item_title'])
         
         # Format title sequence for prompt
         inter_titles = ", ".join([f'"{title}"' for title in history_item_title])
@@ -923,7 +907,7 @@ class RLSeqTitle2SidDataset(CSVBaseDataset):
         is_duplicate = False
         if self.dedup and 'history_item_id' in row:
             try:
-                history_item_id = eval(row['history_item_id'])
+                history_item_id = ast.literal_eval(row['history_item_id'])
                 target_item_id = row.get('item_id', None)
                 last_history_item_id = history_item_id[-1] if history_item_id else None
                 is_duplicate = target_item_id == last_history_item_id
@@ -1203,7 +1187,7 @@ class FusionSeqRecDataset(BaseDataset):
         elif isinstance(description, str) and description.startswith('[') and description.endswith(']'):
             try:
                 # Try to parse string representation of list
-                desc_list = eval(description)
+                desc_list = ast.literal_eval(description)
             except:
                 # If parsing fails, treat as regular string
                 return description if description.strip() else title
@@ -1233,14 +1217,14 @@ class FusionSeqRecDataset(BaseDataset):
         return f"Please review the user's historical interactions: {history}, and describe what kind of item he still needs."
     
     def get_history(self, row):
-        history_item_sid = eval(row['history_item_sid'])
+        history_item_sid = ast.literal_eval(row['history_item_sid'])
         history_str = ", ".join(history_item_sid)
         
         target_sid = row['item_sid']
         
         # Use the new sid2title and sid2description mappings
         if target_sid in self.sid2title:
-            target_title = self.sid2title[target_sid]
+            target_title = self.item_feat[str(row['item_id'])]['title']
         else:
             target_title = target_sid
             
@@ -1249,7 +1233,7 @@ class FusionSeqRecDataset(BaseDataset):
             # Clean description if it's a string representation of a list
             if isinstance(target_description, str) and target_description.startswith("['") and target_description.endswith("']"):
                 try:
-                    desc_list = eval(target_description)
+                    desc_list = ast.literal_eval(target_description)
                     target_description = desc_list[0] if desc_list else target_description
                 except:
                     pass  # Keep original if eval fails
@@ -1319,8 +1303,8 @@ Can you recommend the next item for the user based on their interaction history?
         attention_mask = [1] * len(tokens)
         labels = [-100] * input_prompt_len + tokens[input_prompt_len:]
         
-        if len(tokens) >= self.max_len:
-            print(f"Sequence length {len(tokens)} exceeds max_len {self.max_len}")
+        if len(tokens) > self.max_len:
+            raise ValueError(f"{type(self).__name__} row {idx}: {len(tokens)} tokens exceed max_len={self.max_len}; increase the limit")
         
         return {
             "input_ids": tokens[-self.max_len:],
