@@ -6,14 +6,37 @@
 
 ## 安装与一键运行
 
-Linux、Python 3.11、4 张支持 BF16 的 NVIDIA GPU；建议从官方使用的 A100/H100 级设备开始。以下安装 CUDA 12.4 的 PyTorch 2.6 wheel，需匹配宿主驱动：
+Linux、Python 3.11、4 张支持 BF16 的 NVIDIA GPU；建议从官方使用的 A100/H100 级设备开始。以下安装 CUDA 12.4 的 PyTorch 2.6 wheel，需匹配宿主驱动。命令均在仓库根目录执行。
+
+首次安装环境（已有环境和 CUDA 12.4 Toolkit 时无需重复安装）：
 
 ```bash
 conda create -n minidiprec python=3.11 -y
 conda activate minidiprec
-pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+# PyTorch wheel 不包含 nvcc；将匹配的 Toolkit 安装到当前 conda 环境
+conda install -c nvidia/label/cuda-12.4.1 cuda-toolkit
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+python -m pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 python -m pip install -r requirements-reproduction.txt
+```
 
+**每次新开终端，或切换到其他终端运行训练，都先执行以下设置和检查。** `export` 只影响当前终端，没有写入持久化配置，也不会同步到其他已打开的终端。以下假设 Toolkit 安装在该 conda 环境；若使用系统已有的 CUDA 12.4 Toolkit，将 `CUDA_HOME` 改为其实际目录。
+
+```bash
+conda activate minidiprec
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+
+"$CUDA_HOME/bin/nvcc" -V
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -c 'import torch; import deepspeed; assert torch.cuda.is_available() and torch.cuda.device_count() == 4, "需要四张可见 CUDA GPU"; print("PyTorch:", torch.__version__, "CUDA:", torch.version.cuda, "DeepSpeed:", deepspeed.__version__)'
+```
+
+`nvcc` 应显示 `release 12.4`，Python 检查应无 traceback。若使用其他四卡编号，同步修改检查命令中的 `CUDA_VISIBLE_DEVICES` 和运行命令中的 `--gpus`。检查失败先按 [debug.md](debug.md) 排查；检查通过后，在**同一个终端**首次运行：
+
+```bash
 bash scripts/reproduce.sh --run-name qwen3_h50_seed42 \
   --gpus 0,1,2,3 --model Qwen/Qwen3-0.6B \
   --checkpoint-root /path/to/large_disk/minionerec_checkpoints
@@ -48,6 +71,12 @@ bash scripts/reproduce.sh --run-name qwen3_h50_seed42 --stage prepare
 # 无 GPU 也可以执行：真实 tokenizer 扫描所有启用任务
 bash scripts/reproduce.sh --run-name qwen3_h50_seed42 --stage preflight
 
+# 以下 GPU 阶段先完成上面的环境检查；新终端需重新激活并设置 CUDA 路径
+conda activate minidiprec
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+
 # 仅 Office SFT；stage 还支持 eval-sft、rl、eval-rl、summary
 bash scripts/reproduce.sh --run-name qwen3_h50_seed42 \
   --gpus 0,1,2,3 --dataset Office_Products --stage sft
@@ -63,6 +92,8 @@ bash scripts/reproduce.sh --run-name gpu_smoke --gpus 0,1,2,3 --max-steps 2
 ```
 
 上述单阶段示例使用默认 checkpoint-root；若一键命令使用了自定义 `--checkpoint-root` 或本地 `--model`，**每次继续运行时也传相同参数**。配置、数据指纹或实现变化会拒绝复用旧 run；正式实验不能沿用 `--max-steps` 冒烟 run。恢复包含模型、优化器、scheduler、随机状态、SFT early-stop 状态和 RL reference；RL 缺失 reference 的旧官方 checkpoint 会被拒绝作为续训状态。`selected_model` 是选出的模型导出，只供评估和下一阶段初始化；继续训练使用 `checkpoint-<step>`。
+
+同一 run-name 下，已生成的 50 条历史 CSV 会在哈希校验通过后复用；已有且匹配的 `lengths.json` 也会复用。训练提示构造和 tokenization 目前没有磁盘缓存，各训练进程重启后仍会执行。数据复用不依赖 `--resume`；继续已有实验应加 `--resume`，以跳过已完成阶段并恢复训练 checkpoint。
 
 ## 历史恢复与必要修复
 
