@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Create a separate run from completed SFT, then train/evaluate fresh RL.
+
+Copies SFT artifacts, prepared data and selected model as ordinary files. Never
+copies or resumes source RL checkpoints. The source run is not modified.
+"""
+import argparse
+import datetime
+import json
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from reproduction.prepare import CATEGORIES, prepare, sha256, write_json
+from reproduction.run import summarize
+from scripts.migrate_rl_config_fix import migrate as migrate_source
+
+
+def copy_files(source, target):
+    """Keep both model and portable results independent of the source directory."""
+    if source.is_symlink() or any(path.is_symlink() for path in source.rglob('*')):
+        raise ValueError(f'Expected ordinary files, found a symlink under {source}')
+    shutil.copytree(source, target)
+
+
+def launch_command(repo, config, category):
+    return [
+        sys.executable, '-m', 'reproduction.run', '--run-name', config['run_name'],
+        '--dataset', category, '--gpus', config['gpus'], '--model', config['model'],
+        '--checkpoint-root', str(Path(config['checkpoint_root']).parent),
+        '--sft-micro-batch', str(config['sft_micro_batch']),
+        '--rl-micro-batch', str(config['rl_micro_batch']),
+        '--eval-batch-size', str(config['eval_batch_size']),
+        '--max-steps', str(config['max_steps']), '--resume']
+
+
+def create_run(repo, source_run, run_name, category, micro_batch=32):
+    repo = Path(repo).resolve()
+    for name in (source_run, run_name):
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name):
+            raise ValueError('Run names must be simple directory names')
+    if source_run == run_name:
+        raise ValueError('Use a distinct run name to retain the previous RL experiment')
+    if category not in CATEGORIES:
+        raise ValueError(f'Unsupported category: {category}')
+    if micro_batch < 16 or micro_batch % 16 or 256 % micro_batch:
+        raise ValueError('RL micro batch must be a multiple of 16 dividing 256')
+    source = repo / 'results' / source_run
+    root = repo / 'results' / run_name
+    config = json.loads((source / 'run_config.json').read_text())
+    if config['world_size'] != 4 or config['rl_generations'] != 16 or config['effective_batch'] != 1024:
+        raise ValueError('Expected the four-GPU G16/effective1024 reproduction recipe')
+    source_checkpoint_root = Path(config['checkpoint_root'])
+    checkpoint_root = (source_checkpoint_root.parent / run_name).resolve()
+    if root.exists() or checkpoint_root.exists():
+        raise ValueError('Destination already exists; use its resume command or choose a new run name')
+    if (checkpoint_root == root or root in checkpoint_root.parents
+            or checkpoint_root == source or source in checkpoint_root.parents):
+        raise ValueError('Checkpoint root must be outside the results directories')
+    cat = source / category
+    for name in ('sft.complete.json', 'eval-sft.complete.json', 'training.json',
+                 'valid.metrics.json', 'test.metrics.json',
+                 'valid.predictions.jsonl', 'test.predictions.jsonl'):
+        if not (cat / 'sft' / name).is_file():
+            raise ValueError(f'Completed SFT and evaluation required: {cat / "sft" / name}')
+    training = json.loads((cat / 'sft/training.json').read_text())
+    model = source_checkpoint_root / category / 'sft/selected_model'
+    if Path(training['final_checkpoint']).resolve() != model.resolve():
+        raise ValueError('SFT selected-model path disagrees with training.json')
+    required = ('config.json', 'tokenizer_config.json', 'tokenizer.json')
+    if any(not (model / name).is_file() for name in required):
+        raise ValueError(f'SFT model/tokenizer files unavailable: {model}; run on the training server')
+    weight_files = list(model.glob('*.safetensors')) + list(model.glob('pytorch_model*.bin'))
+    if not weight_files:
+        raise ValueError(f'Missing SFT model weights: {model}')
+    for index in model.glob('*.index.json'):
+        for shard in json.loads(index.read_text()).get('weight_map', {}).values():
+            if not (model / shard).is_file():
+                raise ValueError(f'Missing SFT model shard: {shard}')
+    # Read-only checks: generated CSV integrity and exact code/fix compatibility.
+    if not (cat / 'data/audit.json').is_file():
+        raise ValueError('Missing prepared data audit')
+    prepare(repo / 'data/Amazon', cat / 'data', category)
+    lengths = json.loads((cat / 'lengths.json').read_text())
+    if lengths['model'] != config['model'] or lengths['data_audit_sha256'] != sha256(cat / 'data/audit.json'):
+        raise ValueError('Saved tokenizer preflight does not match data/model')
+    migrate_source(repo, source, dry_run=True)
+    config = dict(config, run_name=run_name, checkpoint_root=str(checkpoint_root),
+                  rl_micro_batch=micro_batch, rl_accumulation=256 // micro_batch)
+    checkpoint_root.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix='.sft-import-', dir=root.parent))
+    checkpoint_staging = Path(tempfile.mkdtemp(prefix='.sft-import-', dir=checkpoint_root.parent))
+    try:
+        dest_cat = staging / category
+        dest_cat.mkdir()
+        for name in ('data', 'sft', 'tokenizer'):
+            if (cat / name).exists():
+                copy_files(cat / name, dest_cat / name)
+        for name in ('lengths.json', 'preflight.log'):
+            if (cat / name).is_file():
+                shutil.copyfile(cat / name, dest_cat / name)
+        selected = checkpoint_staging / category / 'sft/selected_model'
+        selected.parent.mkdir(parents=True)
+        print(f'Copying selected SFT model from step {training["selected_step"]}: {model}', flush=True)
+        copy_files(model, selected)
+        model_hashes = {str(path.relative_to(selected)): sha256(path)
+                        for path in selected.rglob('*') if path.is_file()}
+        for name, expected in model_hashes.items():
+            if sha256(model / name) != expected:
+                raise ValueError(f'SFT model copy mismatch: {name}')
+        copy_files(source / 'source', staging / 'source')
+        shutil.copyfile(source / 'source_sha256.json', staging / 'source_sha256.json')
+        if (source / 'source_migrations').is_dir():
+            copy_files(source / 'source_migrations', staging / 'source_migrations')
+        origin = staging / 'sft_import'
+        origin.mkdir()
+        shutil.copyfile(source / 'run_config.json', origin / 'source_run_config.json')
+        shutil.copyfile(source / 'source_sha256.json', origin / 'source_sha256.json')
+        for name in ('environment.log', 'commands.jsonl', 'invocations.jsonl'):
+            if (source / name).is_file():
+                shutil.copyfile(source / name, origin / name)
+        # Original SFT records retain their actual historical training paths/args.
+        write_json(origin / 'record.json', {
+            'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'source_run': str(source), 'category': category,
+            'source_model': str(model), 'copied_model': str(checkpoint_root / category / 'sft/selected_model'),
+            'selected_step': training['selected_step'], 'model_sha256': model_hashes,
+            'rl_initialization': 'fresh optimizer, scheduler, reference and step 0 from selected SFT model',
+            'copied_artifacts_sha256': {str(path.relative_to(dest_cat)): sha256(path)
+                                       for path in dest_cat.rglob('*') if path.is_file()},
+        })
+        shutil.copyfile(Path(__file__), origin / 'start_rl_from_sft.py')
+        shutil.copyfile(Path(__file__).with_name('migrate_rl_config_fix.py'), origin / 'migrate_rl_config_fix.py')
+        write_json(staging / 'run_config.json', config)
+        migrate_source(repo, staging)
+        summarize(staging)
+        command = launch_command(repo, config, category)
+        (staging / 'resume.sh').write_text('#!/usr/bin/env bash\nset -euo pipefail\n'
+            + 'cd ' + shlex.quote(str(repo)) + '\n' + shlex.join(command) + '\n')
+        checkpoint_staging.rename(checkpoint_root)
+        try:
+            staging.rename(root)
+        except BaseException:
+            checkpoint_root.rename(checkpoint_staging)
+            raise
+    except BaseException:
+        shutil.rmtree(staging)
+        shutil.rmtree(checkpoint_staging)
+        raise
+    print(f'Prepared {root}; only SFT is imported. New RL micro={micro_batch}, accumulation={256 // micro_batch}.')
+    return command
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source-run', required=True)
+    parser.add_argument('--run-name', required=True)
+    parser.add_argument('--dataset', choices=CATEGORIES, default='Office_Products')
+    parser.add_argument('--rl-micro-batch', type=int, default=32)
+    parser.add_argument('--prepare-only', action='store_true', help='copy/import artifacts without starting training')
+    args = parser.parse_args()
+    repo = Path(__file__).resolve().parents[1]
+    command = create_run(repo, args.source_run, args.run_name, args.dataset, args.rl_micro_batch)
+    print(shlex.join(command), flush=True)
+    if not args.prepare_only:
+        subprocess.run(command, cwd=repo, check=True)
+
+
+if __name__ == '__main__':
+    main()

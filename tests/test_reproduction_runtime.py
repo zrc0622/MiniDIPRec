@@ -144,6 +144,74 @@ class RuntimeTests(unittest.TestCase):
             sampler.set_epoch(3)
             self.assertEqual(list(sampler), list(sampler))
 
+    def test_larger_micro_batch_resume_uses_new_batch_and_next_prompts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tok, model, sids, info = self.fixture(tmp)
+            rows = [{'prompt': '### Response:\n', 'target': sids[i] + '\n', 'sample_id': str(i)} for i in range(12)]
+            seen = []
+            def reward(prompts, completions, target, sample_id, **kwargs):
+                seen.extend(sample_id[::16])
+                return ranking_rewards(completions, target)[0]
+            def make(micro, accum, steps):
+                conf = GRPOConfig(output_dir=str(Path(tmp) / 'run'), use_cpu=True,
+                    bf16=False, fp16=False, per_device_train_batch_size=micro,
+                    per_device_eval_batch_size=micro, num_generations=16,
+                    gradient_accumulation_steps=accum, max_steps=steps,
+                    optim='adamw_torch', gradient_checkpointing=False,
+                    report_to='none', save_steps=1, logging_steps=1,
+                    max_completion_length=5, seed=42, disable_tqdm=True,
+                    model_init_kwargs={'torch_dtype': 'float32'})
+                conf.max_prompt_length = 64
+                return ReReTrainer(model=str(tmp), base_model=str(tmp), processing_class=tok,
+                    args=conf, train_dataset=Dataset.from_list(rows), reward_funcs=[reward],
+                    beam_search=True, test_during_training=False, info_file=str(info))
+            first = make(16, 4, 1)
+            first.train()
+            self.assertEqual(len(seen), 4)
+            checkpoint = Path(tmp) / 'run/checkpoint-1'
+            state_path = checkpoint / 'trainer_state.json'
+            state = json.loads(state_path.read_text())
+            self.assertEqual(state['train_batch_size'], 16)
+            state['train_batch_size'] = 32  # same archived JSON change as migration tool
+            state_path.write_text(json.dumps(state))
+            seen.clear()
+            second = make(32, 2, 2)
+            second.train(resume_from_checkpoint=str(checkpoint))
+            self.assertEqual(second._train_batch_size, 32)
+            self.assertEqual(second.state.global_step, 2)
+            expected = list(RepeatRandomSampler(rows, 16, seed=42))[64:128:16]
+            self.assertEqual(seen, [str(i) for i in expected])
+
+    def test_four_rank_update_groups_unchanged_with_larger_micro(self):
+        import math
+        from accelerate.data_loader import BatchSamplerShard
+        from torch.utils.data import BatchSampler
+        # Includes incomplete final batches, and a full update in the next epoch.
+        for count in (65, 128, 130):
+            for epoch in (0, 1):
+                layouts = {}
+                for micro in (16, 32, 64):
+                    accum = 256 // micro
+                    ranks = []
+                    for rank in range(4):
+                        sampler = RepeatRandomSampler(list(range(count)), 16, seed=42)
+                        sampler.set_epoch(epoch)
+                        ranks.append(list(BatchSamplerShard(BatchSampler(sampler, micro, False),
+                            num_processes=4, process_index=rank, split_batches=False, even_batches=True)))
+                    updates = math.ceil(len(ranks[0]) / accum)
+                    self.assertEqual(updates, math.ceil(count / 64))
+                    layouts[micro] = []
+                    for step in range(count // 64):
+                        groups = []
+                        for rank in ranks:
+                            for batch in rank[step * accum:(step + 1) * accum]:
+                                for start in range(0, len(batch), 16):
+                                    self.assertEqual(len(set(batch[start:start + 16])), 1)
+                                groups.extend(batch[::16])
+                        layouts[micro].append(sorted(groups))
+                self.assertEqual(layouts[16], layouts[32])
+                self.assertEqual(layouts[16], layouts[64])
+
     def test_sft_step_and_strict_length(self):
         from data import SidSFTDataset
         import csv

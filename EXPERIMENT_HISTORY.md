@@ -1,5 +1,25 @@
 # Experiment history
 
+## 2026-09-10 — 从已有 SFT 开始新的 micro32 RL
+
+用户明确改为从 SFT checkpoint 初始化新 RL。新增 `scripts/start_rl_from_sft.py`：在独立 run 中实体复制所选类别已经完成的 SFT 产物、已校验历史数据/长度报告和 SFT selected_model；模型权重放到新 checkpoint 目录。保留原 SFT 参数记录、验证选中 step 及源路径，在 `sft_import/` 保存导入来源和模型/产物哈希。旧 run、旧 RL 训练进度和 checkpoint 均不修改。
+
+入口继续使用原串行 runner：跳过导入的 SFT/评估，仅以对应 SFT 模型初始化所选类别 RL，micro32/accum8，从 step0 开始；新目录不含任何旧 RL checkpoint，实际 RL 训练命令不传 `--resume`。随后执行原统一 valid/test 评估和汇总。新 run 中断后用生成的 `resume.sh` 恢复。默认仅 Office；如需新 run 的 Industrial 全流程，另用常规入口指定该类别并保留相同配置。
+
+新增导入与命令路由测试：验证旧产物哈希不变、模型真实复制、无旧 RL 目录、只启动一条 RL 训练和两条评估命令、不向 RL 传续训标志；缺模型/目标目录冲突拒绝、复制失败清理。测试首次发现 macOS `/var` 与 `/private/var` 规范路径差异引起配置校验不匹配，已统一新 checkpoint 根目录的绝对路径。**本机无 GPU，也未收到服务器 SFT 权重；未执行真实模型复制或新的四卡 RL。**
+
+最终回归 **26/26 PASS**，日志位于 `results/fresh_rl32_validation_20260910/checks/regression.log`。Python/README Bash 语法和 whitespace 检查通过。原实验的环境、命令和调用记录（若存在）也复制到 `sft_import/`，便于区别旧 SFT 与新 RL 的执行来源。
+
+## 2026-09-10 — 显存允许时将 RL 微批次提高到 32
+
+用户要求加速并确认显存允许。保持默认 recipe 不变，为已有实验提供显式运行适配：`--rl-micro-batch 32`，梯度累积自动从 16 降到 8，四卡每次完整更新仍为 1024 个候选、64 个 G16 prompt 组。实际训练函数、奖励、模型、学习率、attention backend 和训练轮数不变。RL 内部验证微批次跟随变为 32，最终推荐评估配置不变。
+
+新增 `scripts/migrate_rl_batch.py`，避免直接改参数后被运行配置校验拒绝，以及 Transformers 4.57.1 用 checkpoint `train_batch_size` 覆盖新微批次的问题。迁移在结果目录归档原配置、checkpoint JSON 与 step，再更新 batch 元数据；模型、优化器、scheduler、reference 和 RNG 文件不变。源码仍严格检查，可连同前述 dtype 修复完成迁移，保留已有 SFT；未对收到的远端结果执行实际迁移。
+
+本地 CPU 实际 ReReTrainer 验证 micro16/accum4 训练保存后，以 micro32/accum2 恢复：实际 dataloader batch 为32，global_step 正确继续，下一更新的 prompt 恰为应消费样本。实际 Accelerate 四 rank sampler 核验 micro16/32/64、跨 epoch 与非整批数据：每完整更新 prompt 集合一致，G16 分组完整，更新总数一致。并行分配、随机生成调用及尾部补齐可能变化，不承诺逐位复现。**尚未执行四卡 DeepSpeed 的这次 batch 切换及吞吐验证，不宣称加速倍数。**
+
+最终回归 **23/23 PASS**；迁移预览、JSON 备份、参数拒绝、中断重试和重复执行通过。日志：`results/rl_batch_adaptation_20260910/checks/regression.log`。Python、README Bash 语法及 whitespace 检查通过。
+
 ## 2026-09-10 — 远端 Office SFT 结果与 RL 初始化修复
 
 检查用户提供的 `results/qwen3_h50_seed42/`。Office SFT 在 step 504（epoch 6.07248）正常早停：step 378 验证 loss 最低为 1.3855953216552734，后续 step 420/462/504 连续三次未改善。评估与 RL 初始化使用该验证集选出的模型，checkpoint 路径记录在 `Office_Products/sft/training.json`，服务器默认目录为 `checkpoints/qwen3_h50_seed42/Office_Products/sft/`。

@@ -60,6 +60,49 @@ SFT 全模型训练，保留 SID 历史→SID、SID↔title、SID 历史→title
 
 可用 `--sft-micro-batch 8 --rl-micro-batch 32` 适配显存，累积自动计算，仍保持 batch 1024；RL micro 必须为 16 的倍数，低于 16 会明确拒绝。每张卡的候选生成必须持有完整的 G=16 组。默认评估 batch 为 2，可通过 `--eval-batch-size` 调整。各 epoch 的不足整批尾部沿用官方 Trainer/Accelerate 行为，可能有补齐和不足完整累积更新；批大小等价指正常完整更新。
 
+### 显存允许时提高 RL 微批次
+
+只需设置 `--rl-micro-batch`，梯度累积自动为 `256 / micro`：16→累积16，32→累积8，64→累积4；均为四卡、G16、每次完整更新 1024 个候选。当前先建议 32。增大微批次可能减少循环开销，但 prompt padding 增多也可能抵消收益，未实测 GPU 加速倍数。
+
+**从已有 SFT 重新开始 micro32 RL（用户当前选择）**：先停止占用同一组 GPU 的旧训练，将 `scripts/start_rl_from_sft.py`、`scripts/migrate_rl_config_fix.py` 和已修复的 `minionerec_trainer.py` 同步到服务器仓库。在仓库根目录执行：
+
+```bash
+conda activate minidiprec
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+
+python scripts/start_rl_from_sft.py \
+  --source-run qwen3_h50_seed42 \
+  --run-name qwen3_h50_seed42_rl32 \
+  --dataset Office_Products --rl-micro-batch 32
+```
+
+此命令创建新 run，继承源 run 的 GPU、原始模型名、评估设置及 checkpoint 根目录；将已完成的 Office SFT 产物、50 条历史数据及长度扫描结果复制到新结果目录，把验证集选中的 SFT `selected_model` 实体复制到新 checkpoint 目录（不使用软链接）。SFT 不重跑，旧 RL 的权重/优化器/步数不继承，新 RL 从 step 0 开始，完成后自动评估并与已导入 SFT 汇总。旧 run 和旧 RL 不修改。`sft_import/record.json` 记录来源、SFT step、复制文件哈希；大模型权重仍在结果目录外。该入口只运行所选类别的 RL 与评估，不启动 Industrial；后续可用常规入口在新 run 中执行 Industrial 全流程。
+
+`--prepare-only` 可只导入而不启动训练。新 run 已创建后需要继续运行时，保持 CUDA 环境设置并执行 `bash results/qwen3_h50_seed42_rl32/resume.sh`；无需重复导入。这个脚本只跳过已导入的 SFT，首次运行因新目录没有 RL checkpoint 而从 SFT 开始，之后中断才恢复新 run 自己的 RL checkpoint。打包命令为 `python scripts/package_results.py qwen3_h50_seed42_rl32`。
+
+**从旧 RL checkpoint 接着训练**时，才使用下面的 batch 迁移流程：
+
+**已有 run 不能只改启动参数。** Transformers 恢复时会从 `trainer_state.json` 取旧微批次，可能覆盖新配置。先将 `scripts/migrate_rl_batch.py`、`scripts/migrate_rl_config_fix.py` 和已修复的 `minionerec_trainer.py` 同步到服务器，等待完整 checkpoint 保存后停止当前训练；以下操作在服务器仓库根目录执行：
+
+```bash
+conda activate minidiprec
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+
+# 可选预览：增加 --dry-run；正式迁移不要带该参数
+python scripts/migrate_rl_batch.py --run-name qwen3_h50_seed42 --rl-micro-batch 32
+
+# 迁移成功后继续；其他模型/路径/batch 参数沿用原实验
+bash scripts/reproduce.sh --run-name qwen3_h50_seed42 \
+  --gpus 0,1,2,3 --model Qwen/Qwen3-0.6B \
+  --rl-micro-batch 32 --resume
+```
+
+迁移会在结果目录 `config_migrations/` 备份并记录旧配置和 checkpoint JSON，再更新运行配置与未完成 RL 阶段的 checkpoint batch 字段。已有 SFT、数据、模型权重、优化器、scheduler、reference、RNG 状态及 global_step 不变；需要时会先执行上一项 dtype 修复的源码迁移。没有 checkpoint 时该 RL 阶段从头开始；已有 checkpoint 则恢复最近完整 checkpoint，未保存的进度需重算。此适配改变并行分组、padding 和随机生成调用，不保证逐位一致；epoch 尾部补齐也可能不同。RL 训练期间的每卡验证微批次跟随该参数变为 32，最终 beam=50 评估设置不变。迁移后每次续跑都带 `--rl-micro-batch 32`。
+
 ## 单阶段与断点恢复
 
 所有阶段均通过相同入口，沿用同一 run-name、模型、四卡和 batch 参数：
@@ -171,7 +214,7 @@ python scripts/package_results.py qwen3_h50_seed42
 ## 本地检查
 
 ```bash
-python -m unittest tests.test_reproduction tests.test_reproduction_runtime tests.test_rl_config_migration -v
+python -m unittest tests.test_reproduction tests.test_reproduction_runtime tests.test_rl_config_migration tests.test_rl_batch_migration tests.test_start_rl_from_sft -v
 # 可选：使用真实 Qwen3 tokenizer 跑 beam=50 小模型解码检查
 QWEN3_TOKENIZER=/path/to/Qwen3-0.6B python -m unittest tests.test_reproduction_runtime -v
 # CPU 四进程检查（使用小随机 Qwen3；不是正式 GPU 性能验证）
