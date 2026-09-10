@@ -2,7 +2,7 @@
 
 本分支提供 `Qwen/Qwen3-0.6B`、最近最多 50 次交互、单机指定四卡的 **Office SFT → 评估 → RL → 评估 → Industrial 同一流程**。两个类别分别从原始 Qwen3 开始；RL 仅继承本类别通过验证集选择的 SFT 模型。方法以官方实际启用的 `sft.py` / `rl.py` 为准，不包含 GPR、TS-Rec 或新增推荐方法。
 
-当前已完成全量数据检查、真实 Qwen3 tokenizer 全任务长度扫描、小模型 SFT/RL/恢复、四进程 CPU 分布式检查。**本机没有 CUDA GPU，尚未执行 Qwen3-0.6B 完整训练、CUDA/ZeRO-2/bitsandbytes 路径、GPU 显存与吞吐检查，也没有 SFT/RL 最终指标。** 详细记录见 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md)。
+当前已完成全量数据检查、真实 Qwen3 tokenizer 全任务长度扫描、小模型 SFT/RL/恢复、四进程 CPU 分布式检查。2026-09-10 收到的远端结果中，Office SFT 和评估已完成，测试集 HR@5=0.139334、HR@10=0.165228；RL 在首次更新前因参数 JSON 序列化失败退出，该问题已修复。**本机没有 CUDA GPU，尚未验证修复后的四卡 RL/ZeRO-2/bitsandbytes 路径；Industrial 尚无结果，不能比较 RL 前后效果。** 详细记录见 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md)。
 
 ## 安装与一键运行
 
@@ -95,6 +95,28 @@ bash scripts/reproduce.sh --run-name gpu_smoke --gpus 0,1,2,3 --max-steps 2
 
 同一 run-name 下，已生成的 50 条历史 CSV 会在哈希校验通过后复用；已有且匹配的 `lengths.json` 也会复用。训练提示构造和 tokenization 目前没有磁盘缓存，各训练进程重启后仍会执行。数据复用不依赖 `--resume`；继续已有实验应加 `--resume`，以跳过已完成阶段并恢复训练 checkpoint。
 
+### 已有实验遇到 RL 参数 JSON 错误
+
+若 `Office_Products/rl/train.log` 报 `TypeError: Object of type dtype is not JSON serializable`，这是首次 RL 更新前记录参数时的错误。trainer 原来原地修改 `model_init_kwargs`，将字符串改成 `torch.dtype`；现改为复制字典后供模型加载使用，模型精度、训练参数、奖励和任务不变。训练结束后的参数记录也因此得到修复。
+
+先将修复后的 `minionerec_trainer.py` 和新增 `scripts/migrate_rl_config_fix.py` 同步到服务器仓库。在训练停止的情况下，使用原环境和运行名执行：
+
+```bash
+conda activate minidiprec
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+
+# 仅迁移已存在的旧 run；首次运行新 run 无需此步骤
+python scripts/migrate_rl_config_fix.py --run-name qwen3_h50_seed42
+
+# 迁移成功后执行；默认 checkpoint-root 与本次远端实验一致
+bash scripts/reproduce.sh --run-name qwen3_h50_seed42 \
+  --gpus 0,1,2,3 --model Qwen/Qwen3-0.6B --resume
+```
+
+迁移工具只接受这一个配置字典复制修复，拒绝其他源码差异，支持 `--dry-run` 预览。它在 `results/<run_name>/source_migrations/rl_config_copy_v1/` 保留旧源码哈希、修复前后 trainer 和迁移记录，再更新当前源码快照；不修改数据、已有指标或 checkpoint。不要删除源码哈希文件绕过校验。继续运行会跳过 Office 已完成的 SFT 和评估，从对应 SFT 模型开始 RL，随后完成 Industrial 全流程。
+
 ## 历史恢复与必要修复
 
 官方处理程序按目标时间排序交互并切成 train/valid/test，每条 history 最多 10 条。新程序严格按三个原始文件的原始行序逐行重放：首次出现的用户必须有 1 条历史；每个后继 history 必须等于已恢复过去交互的末尾 `min(10, 已知长度)` 条。检查通过后，先输出目标之前最近最多 50 条，随后才把当前目标加入已知序列。断链、缺开头、乱序、缺 metadata、item/SID/title 不匹配立即报错，不尝试猜测或按 item ID 排序。保留行数、行序、目标、划分、SID；新增稳定 `sample_id`、`target_position` 用于审计。生成文件单独写到结果目录。
@@ -149,7 +171,7 @@ python scripts/package_results.py qwen3_h50_seed42
 ## 本地检查
 
 ```bash
-python -m unittest tests.test_reproduction tests.test_reproduction_runtime -v
+python -m unittest tests.test_reproduction tests.test_reproduction_runtime tests.test_rl_config_migration -v
 # 可选：使用真实 Qwen3 tokenizer 跑 beam=50 小模型解码检查
 QWEN3_TOKENIZER=/path/to/Qwen3-0.6B python -m unittest tests.test_reproduction_runtime -v
 # CPU 四进程检查（使用小随机 Qwen3；不是正式 GPU 性能验证）

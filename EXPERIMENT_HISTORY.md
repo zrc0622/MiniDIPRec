@@ -1,5 +1,24 @@
 # Experiment history
 
+## 2026-09-10 — 远端 Office SFT 结果与 RL 初始化修复
+
+检查用户提供的 `results/qwen3_h50_seed42/`。Office SFT 在 step 504（epoch 6.07248）正常早停：step 378 验证 loss 最低为 1.3855953216552734，后续 step 420/462/504 连续三次未改善。评估与 RL 初始化使用该验证集选出的模型，checkpoint 路径记录在 `Office_Products/sft/training.json`，服务器默认目录为 `checkpoints/qwen3_h50_seed42/Office_Products/sft/`。
+
+| 数据集 / 阶段 | split | 样本数 | HR/Recall@5 | HR/Recall@10 | NDCG@5 | NDCG@10 |
+|---|---|---|---|---|---|---|
+| Office / SFT | valid | 4866 | 0.206535 | 0.232840 | 0.180333 | 0.188823 |
+| Office / SFT | test | 4866 | 0.139334 | 0.165228 | 0.115878 | 0.124300 |
+
+独立读取两个逐样本预测文件，核验每行 sample_id、目标 SID/item 与对应 CSV 一致，各行有 50 个唯一合法候选 SID，候选 item 列表与官方映射一致；重算全部指标与保存值一致。此结果来自用户服务器，未在本地重新训练或推理；测试指标只记录，不用于调参或选模型。
+
+RL 在首次更新前写入 `training_args.json` 时失败，日志第 613 行为 `TypeError: Object of type dtype is not JSON serializable`。根因是官方 trainer 将 `args.model_init_kwargs` 字典直接作为模型加载参数使用，原地将 `'bfloat16'` 改成 `torch.bfloat16`，使后续参数记录无法 JSON 序列化。本次仅将该字典复制后用于模型加载，保留实际 BF16、use_cache、trainer、奖励及优化器设置；同时修复训练结束时 `training.json` 的同类隐患。
+
+新增 `scripts/migrate_rl_config_fix.py`，严格验证旧 run 只有这一行修复差异后，归档原始源码哈希与修复前后 trainer，再更新当前源码快照。已完成的 Office SFT/评估、所有数据和 checkpoint 不变；迁移后原命令加 `--resume` 即可继续，不必重新 SFT。迁移用法见 README。
+
+本地已用真实 ReReTrainer + 小随机 Qwen3 重现相同报错；修复后 BF16 模型/参考模型加载、配置无副作用和训练前 JSON 写入通过。CPU RL train/eval、训练后参数记录、reference checkpoint 恢复通过。**未在本地执行修复后的四卡 CUDA/ZeRO-2/bitsandbytes RL；当前没有 RL 指标，Industrial 尚未开始，无法判断 RL 是否提升。**
+
+本次最终回归 **17/17 PASS**，包含真实 Qwen3 tokenizer 检查及迁移归档、重复执行、中断恢复、额外源码修改/快照篡改拒绝。对收到的原实验仅执行迁移 dry-run，未改写其产物。验证日志和预测复核报告位于 `results/rl_startup_fix_20260910/checks/`。Python 解析、README Bash 语法及 git whitespace 检查通过。
+
 ## 2026-09-09 — MiniOneRec / Qwen3-0.6B / recent-50 / four GPUs
 
 本次完成复现代码与本地验证，**未执行正式 GPU 训练或最终测试集评估**。没有论文指标复现结论，也不预设 RL 提升。

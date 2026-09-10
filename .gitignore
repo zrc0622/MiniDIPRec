@@ -12,6 +12,8 @@ venv/
 
 # Generated experiment artifacts (including packaged results)
 /results/
+/results.zip
+/__MACOSX/
 /checkpoints/
 /output/
 /output_dir/

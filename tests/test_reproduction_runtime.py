@@ -64,6 +64,7 @@ class RuntimeTests(unittest.TestCase):
                     gradient_checkpointing=False, report_to='none', save_steps=1, eval_strategy='steps',
                     eval_steps=1, logging_steps=1, max_completion_length=trie.max_new_tokens, beta=.001,
                     sync_ref_model=True, ref_model_sync_steps=1, seed=42, disable_tqdm=True,
+                    model_init_kwargs={'torch_dtype': 'float32'},
                     load_best_model_at_end=True, metric_for_best_model='eval_reward', greater_is_better=True)
                 conf.max_prompt_length = 64
                 return ReReTrainer(model=str(tmp), base_model=str(tmp), processing_class=tok, args=conf,
@@ -71,7 +72,12 @@ class RuntimeTests(unittest.TestCase):
                     eval_dataset=Dataset.from_list(rows[:2]), beam_search=True, test_during_training=False,
                     info_file=str(info))
             first = make(Path(tmp) / 'run', 1)
+            # Same metadata write as the reproduction entrypoint, before training.
+            from reproduction.prepare import write_json
+            from reproduction.runtime import training_record
+            write_json(Path(tmp) / 'training_args.json', first.args.to_dict())
             first.train()
+            training_record(first, tmp, Path(tmp) / 'run', str(tmp))
             saved = Path(tmp) / 'run/checkpoint-1'
             self.assertTrue((saved / 'reference_model.pt').is_file())
             self.assertEqual(first.state.global_step, 1)
@@ -89,6 +95,32 @@ class RuntimeTests(unittest.TestCase):
             second.max_prompt_length = 1
             with self.assertRaisesRegex(ValueError, 'no truncation'):
                 second._prepare_inputs(inputs)
+
+    def test_rl_bfloat16_init_preserves_serializable_config(self):
+        from reproduction.prepare import write_json
+        with tempfile.TemporaryDirectory() as tmp:
+            tok, model, sids, info = self.fixture(tmp)
+            original_kwargs = {'torch_dtype': 'bfloat16'}
+            conf = GRPOConfig(output_dir=str(Path(tmp) / 'run'), use_cpu=True,
+                bf16=False, fp16=False, per_device_train_batch_size=16,
+                per_device_eval_batch_size=16, num_generations=16,
+                model_init_kwargs=original_kwargs, gradient_checkpointing=True,
+                gradient_checkpointing_kwargs={'use_reentrant': False},
+                report_to='none', max_completion_length=5)
+            rows = [{'prompt': '### Response:\n', 'target': sids[0] + '\n', 'sample_id': '0'}]
+            def reward(prompts, completions, target, **kwargs):
+                return ranking_rewards(completions, target)[0]
+            trainer = ReReTrainer(model=str(tmp), base_model=str(tmp), processing_class=tok,
+                args=conf, train_dataset=Dataset.from_list(rows), reward_funcs=[reward],
+                beam_search=True, test_during_training=False, info_file=str(info))
+            self.assertEqual(trainer.model.dtype, torch.bfloat16)
+            self.assertEqual(trainer.ref_model.dtype, torch.bfloat16)
+            self.assertFalse(trainer.model.config.use_cache)
+            # This used to fail: model loading mutated the config to torch.dtype.
+            write_json(Path(tmp) / 'training_args.json', trainer.args.to_dict())
+            self.assertEqual(original_kwargs, {'torch_dtype': 'bfloat16'})
+            recorded = json.loads((Path(tmp) / 'training_args.json').read_text())
+            self.assertEqual(recorded['model_init_kwargs'], original_kwargs)
 
     def test_sampler_four_rank_layout_and_resume_epoch(self):
         from accelerate.data_loader import BatchSamplerShard

@@ -256,7 +256,7 @@ class ReReTrainer(Trainer):
         # Models
         # Trained model
         self.base_model = base_model
-        model_init_kwargs = args.model_init_kwargs or {}
+        model_init_kwargs = dict(args.model_init_kwargs or {})
         if isinstance(model, str):
             model_id = model
             torch_dtype = model_init_kwargs.get("torch_dtype")
