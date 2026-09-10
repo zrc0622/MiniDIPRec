@@ -743,6 +743,7 @@ class ReReTrainer(Trainer):
                     # print(f"dedup_prompt_ids: {dedup_prompt_ids.shape}")
                     prompt_completion_ids = unwrapped_model.generate(
                         dedup_prompt_ids, attention_mask=dedup_prompt_mask, generation_config=self.generation_config,
+                        use_model_defaults=False,
                         logits_processor=self.logits_processor,
                     )
                     # print(f"prompt_ids: {prompt_ids.shape}")

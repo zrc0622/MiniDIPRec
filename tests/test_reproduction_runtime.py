@@ -122,6 +122,40 @@ class RuntimeTests(unittest.TestCase):
             recorded = json.loads((Path(tmp) / 'training_args.json').read_text())
             self.assertEqual(recorded['model_init_kwargs'], original_kwargs)
 
+    def test_rl_generation_does_not_inherit_qwen_sampling_defaults(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            tok, model, sids, info = self.fixture(tmp)
+            model.generation_config.temperature = 0.6
+            model.generation_config.do_sample = True
+            model.generation_config.top_k = 20
+            model.generation_config.top_p = 0.95
+            model.save_pretrained(tmp)
+            rows = [{'prompt': '### Response:\n', 'target': sids[0] + '\n', 'sample_id': '0'}]
+            def reward(prompts, completions, target, **kwargs):
+                return ranking_rewards(completions, target)[0]
+            conf = GRPOConfig(output_dir=str(Path(tmp) / 'run'), use_cpu=True, bf16=False,
+                per_device_train_batch_size=16, per_device_eval_batch_size=16,
+                num_generations=16, temperature=1.0, max_completion_length=5,
+                gradient_checkpointing=False, report_to='none')
+            trainer = ReReTrainer(model=str(tmp), base_model=str(tmp), processing_class=tok,
+                args=conf, train_dataset=Dataset.from_list(rows), reward_funcs=[reward],
+                beam_search=True, test_during_training=False, info_file=str(info))
+            actual = []
+            original = trainer.model._prepare_generation_config
+            def capture(*args, **kwargs):
+                result = original(*args, **kwargs)
+                actual.append(result[0])
+                return result
+            with patch.object(trainer.model, '_prepare_generation_config', side_effect=capture):
+                trainer._prepare_inputs(rows * 16)
+            self.assertEqual(len(actual), 1)
+            self.assertEqual(actual[0].temperature, 1.0)
+            self.assertTrue(actual[0].do_sample)
+            self.assertEqual(actual[0].num_beams, 16)
+            self.assertIsNone(actual[0].top_k)
+            self.assertIsNone(actual[0].top_p)
+
     def test_sampler_four_rank_layout_and_resume_epoch(self):
         from accelerate.data_loader import BatchSamplerShard
         from torch.utils.data import BatchSampler
@@ -239,6 +273,8 @@ class RealQwenTokenizerTests(unittest.TestCase):
         from transformers import AutoTokenizer, GenerationConfig, LogitsProcessorList
         from data import SidSFTDataset
         from reproduction.contracts import check_tokenizer, next_prompt
+        from reproduction.evaluate import generate_candidates
+        from unittest.mock import patch
         import ast
         import csv
         torch.set_num_threads(1)
@@ -269,11 +305,29 @@ class RealQwenTokenizerTests(unittest.TestCase):
             num_hidden_layers=1, num_attention_heads=1, num_key_value_heads=1, head_dim=16,
             max_position_embeddings=512, eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id)).eval()
         check_tokenizer(tokenizer, indices, model)
+        # Match actual saved Qwen3 defaults, which must not turn eval into sampling.
+        model.generation_config.do_sample = True
+        model.generation_config.temperature = 0.6
+        model.generation_config.top_k = 20
+        model.generation_config.top_p = 0.95
         x = tokenizer(['### Response:\n', prefix], padding=True, return_tensors='pt', add_special_tokens=False)
+        conf = GenerationConfig(num_beams=50, num_return_sequences=50,
+            do_sample=False, max_new_tokens=5, length_penalty=0, eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id, top_k=None, top_p=None)
+        actual = []
+        original = model._prepare_generation_config
+        def capture(*args, **kwargs):
+            result = original(*args, **kwargs)
+            actual.append(result[0])
+            return result
         with torch.inference_mode():
-            generated = model.generate(**x, generation_config=GenerationConfig(num_beams=50, num_return_sequences=50,
-                do_sample=False, max_new_tokens=5, length_penalty=0, eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id), logits_processor=LogitsProcessorList([trie.processor(x.input_ids.shape[1])]))
+            with patch.object(model, '_prepare_generation_config', side_effect=capture):
+                generated = generate_candidates(model, x, conf,
+                    LogitsProcessorList([trie.processor(x.input_ids.shape[1])]))
+        self.assertFalse(actual[0].do_sample)
+        self.assertEqual(actual[0].temperature, 1.0)
+        self.assertIsNone(actual[0].top_k)
+        self.assertIsNone(actual[0].top_p)
         decoded = tokenizer.batch_decode(generated[:, x.input_ids.shape[1]:], skip_special_tokens=True)
         catalog = {''.join(v) for v in indices.values()}
         self.assertEqual(len(decoded), 100)

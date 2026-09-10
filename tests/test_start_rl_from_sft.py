@@ -2,6 +2,7 @@ import csv
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -105,6 +106,56 @@ class FreshRLTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Missing SFT model weights'):
                 create_run(repo, 'run', 'fresh', CATEGORIES[0])
             self.assertFalse((repo / 'results/fresh').exists())
+
+    def test_reimport_uses_independent_model_after_original_run_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, source, model = self.fixture(tmp)
+            create_run(repo, 'run', 'rl64', CATEGORIES[0], 64)
+            shutil.rmtree(source)
+            shutil.rmtree(repo / 'checkpoints/run')
+            create_run(repo, 'rl64', 'rl32', CATEGORIES[0], 32)
+            root = repo / 'results/rl32'
+            self.assertTrue((root / 'sft_import/previous_import/record.json').is_file())
+            copied = repo / f'checkpoints/rl32/{CATEGORIES[0]}/sft/selected_model'
+            self.assertEqual((copied / 'model.safetensors').read_bytes(), b'test weight fixture')
+            self.assertFalse((copied.parent.parent / 'rl').exists())
+            (copied / 'model.safetensors').write_bytes(b'changed model')
+            with self.assertRaisesRegex(ValueError, 'hashes disagree'):
+                create_run(repo, 'rl32', 'rejected', CATEGORIES[0], 32)
+
+    def test_old_sampling_evaluation_is_archived_then_rerun(self):
+        from scripts.start_rl_from_sft import EVAL_HELPER, EVAL_NEW, EVAL_OLD, GENERATION_FLAG
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, source, model = self.fixture(tmp)
+            old_eval = EVAL_OLD + b'\n'
+            (source / 'source/reproduction/evaluate.py').write_bytes(old_eval)
+            (repo / 'reproduction/evaluate.py').write_bytes(EVAL_HELPER + EVAL_NEW + b'\n')
+            with (repo / 'minionerec_trainer.py').open('ab') as f:
+                f.write(GENERATION_FLAG)
+            manifest = json.loads((source / 'source_sha256.json').read_text())
+            manifest['reproduction/evaluate.py'] = sha256(source / 'source/reproduction/evaluate.py')
+            write_json(source / 'source_sha256.json', manifest)
+            command = create_run(repo, 'run', 'fixed', CATEGORIES[0], 32)
+            root = repo / 'results/fixed'
+            self.assertTrue((root / CATEGORIES[0] / 'sft/sft.complete.json').is_file())
+            self.assertFalse((root / CATEGORIES[0] / 'sft/eval-sft.complete.json').exists())
+            self.assertFalse((root / CATEGORIES[0] / 'sft/test.metrics.json').exists())
+            self.assertTrue((root / 'sft_import/superseded_sft_evaluation/test.metrics.json').is_file())
+            self.assertEqual(json.loads((root / 'summary.json').read_text()), [])
+            self.assertTrue((source / CATEGORIES[0] / 'sft/test.metrics.json').is_file())
+            saved = Path.cwd()
+            try:
+                with patch.object(run, 'REPO', repo), patch.object(sys, 'argv', ['run', *command[3:], '--dry-run']):
+                    run.main()
+            finally:
+                os.chdir(saved)
+            calls = [json.loads(line)['argv'] for line in (root / 'commands.jsonl').read_text().splitlines()]
+            modules = ['reproduction.train' if 'reproduction.train' in c else 'reproduction.evaluate' for c in calls]
+            self.assertEqual(modules, ['reproduction.evaluate'] * 2 + ['reproduction.train'] + ['reproduction.evaluate'] * 2)
+            with (repo / 'reproduction/evaluate.py').open('ab') as f:
+                f.write(b'# unrelated change\n')
+            with self.assertRaisesRegex(ValueError, 'Unrelated source change'):
+                create_run(repo, 'run', 'rejected', CATEGORIES[0], 32)
 
     def test_failed_copy_does_not_leave_new_run(self):
         with tempfile.TemporaryDirectory() as tmp:

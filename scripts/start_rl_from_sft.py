@@ -18,7 +18,52 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from reproduction.prepare import CATEGORIES, prepare, sha256, write_json
 from reproduction.run import summarize
-from scripts.migrate_rl_config_fix import migrate as migrate_source
+from scripts.migrate_rl_config_fix import BEFORE, AFTER, digest
+
+
+GENERATION_FLAG = b'                        use_model_defaults=False,\n'
+EVAL_HELPER = b'''def generate_candidates(model, inputs, conf, processors):
+    # Qwen's saved defaults include do_sample=True and temperature=0.6. Without
+    # this flag, HF >=4.50 overwrites even explicit default-valued config fields.
+    return model.generate(**inputs, generation_config=conf,
+                          logits_processor=processors, use_model_defaults=False)
+
+
+'''
+EVAL_OLD = b'''            generated = model.generate(**inputs, generation_config=conf,
+                logits_processor=LogitsProcessorList([trie.processor(width)]))'''
+EVAL_NEW = b'''            generated = generate_candidates(model, inputs, conf,
+                LogitsProcessorList([trie.processor(width)]))'''
+
+
+def check_source(repo, source):
+    """Allow only reviewed dtype/generation fixes when importing completed SFT."""
+    files = list((repo / 'reproduction').glob('*.py')) + [repo / name for name in (
+        'data.py', 'minionerec_trainer.py', 'requirements-reproduction.txt',
+        'config/zero2_opt.yaml', 'scripts/reproduce.sh')]
+    current = {str(path.relative_to(repo)): path.read_bytes() for path in files}
+    recorded = json.loads((source / 'source_sha256.json').read_text())
+    if current.keys() != recorded.keys():
+        raise ValueError('Source file list changed beyond supported SFT import fixes')
+    changes = []
+    for name, content in current.items():
+        if sha256(source / 'source' / name) != recorded[name]:
+            raise ValueError(f'Original source snapshot changed: {name}')
+        if digest(content) == recorded[name]:
+            continue
+        variants = []
+        if name == 'minionerec_trainer.py':
+            variants = [content.replace(AFTER, BEFORE, 1)]
+            if content.count(GENERATION_FLAG) == 1:
+                old_generation = content.replace(GENERATION_FLAG, b'', 1)
+                variants.extend([old_generation, old_generation.replace(AFTER, BEFORE, 1)])
+        elif name == 'reproduction/evaluate.py':
+            if content.count(EVAL_HELPER) == 1 and content.count(EVAL_NEW) == 1:
+                variants = [content.replace(EVAL_HELPER, b'', 1).replace(EVAL_NEW, EVAL_OLD, 1)]
+        if not any(digest(variant) == recorded[name] for variant in variants):
+            raise ValueError(f'Unrelated source change refused: {name}')
+        changes.append(name)
+    return current, changes
 
 
 def copy_files(source, target):
@@ -70,7 +115,19 @@ def create_run(repo, source_run, run_name, category, micro_batch=32):
             raise ValueError(f'Completed SFT and evaluation required: {cat / "sft" / name}')
     training = json.loads((cat / 'sft/training.json').read_text())
     model = source_checkpoint_root / category / 'sft/selected_model'
-    if Path(training['final_checkpoint']).resolve() != model.resolve():
+    imported = source / 'sft_import/record.json'
+    record = json.loads(imported.read_text()) if imported.is_file() else {}
+    if record.get('category') == category:
+        # Imported SFT training.json intentionally retains its historical path.
+        # Validate the independent local copy without requiring that path to exist.
+        if (Path(record['copied_model']).resolve() != model.resolve()
+                or record['selected_step'] != training['selected_step']):
+            raise ValueError('Imported SFT model/step disagrees with provenance')
+        actual = {str(path.relative_to(model)): sha256(path)
+                  for path in model.rglob('*') if path.is_file()}
+        if not actual or actual != record['model_sha256']:
+            raise ValueError('Imported SFT model hashes disagree with provenance')
+    elif Path(training['final_checkpoint']).resolve() != model.resolve():
         raise ValueError('SFT selected-model path disagrees with training.json')
     required = ('config.json', 'tokenizer_config.json', 'tokenizer.json')
     if any(not (model / name).is_file() for name in required):
@@ -89,7 +146,10 @@ def create_run(repo, source_run, run_name, category, micro_batch=32):
     lengths = json.loads((cat / 'lengths.json').read_text())
     if lengths['model'] != config['model'] or lengths['data_audit_sha256'] != sha256(cat / 'data/audit.json'):
         raise ValueError('Saved tokenizer preflight does not match data/model')
-    migrate_source(repo, source, dry_run=True)
+    current_source, changed_source = check_source(repo, source)
+    # Older evaluator may have inherited Qwen's sampling defaults even though its
+    # metrics JSON claimed deterministic decoding. Always rerun that evaluation.
+    reevaluate = 'reproduction/evaluate.py' in changed_source
     config = dict(config, run_name=run_name, checkpoint_root=str(checkpoint_root),
                   rl_micro_batch=micro_batch, rl_accumulation=256 // micro_batch)
     checkpoint_root.parent.mkdir(parents=True, exist_ok=True)
@@ -119,8 +179,11 @@ def create_run(repo, source_run, run_name, category, micro_batch=32):
             copy_files(source / 'source_migrations', staging / 'source_migrations')
         origin = staging / 'sft_import'
         origin.mkdir()
+        if (source / 'sft_import').is_dir():
+            copy_files(source / 'sft_import', origin / 'previous_import')
         shutil.copyfile(source / 'run_config.json', origin / 'source_run_config.json')
         shutil.copyfile(source / 'source_sha256.json', origin / 'source_sha256.json')
+        copy_files(source / 'source', origin / 'source')
         for name in ('environment.log', 'commands.jsonl', 'invocations.jsonl'):
             if (source / name).is_file():
                 shutil.copyfile(source / name, origin / name)
@@ -130,6 +193,7 @@ def create_run(repo, source_run, run_name, category, micro_batch=32):
             'source_run': str(source), 'category': category,
             'source_model': str(model), 'copied_model': str(checkpoint_root / category / 'sft/selected_model'),
             'selected_step': training['selected_step'], 'model_sha256': model_hashes,
+            'source_fixes': changed_source, 'sft_requires_reevaluation': reevaluate,
             'rl_initialization': 'fresh optimizer, scheduler, reference and step 0 from selected SFT model',
             'copied_artifacts_sha256': {str(path.relative_to(dest_cat)): sha256(path)
                                        for path in dest_cat.rglob('*') if path.is_file()},
@@ -137,7 +201,19 @@ def create_run(repo, source_run, run_name, category, micro_batch=32):
         shutil.copyfile(Path(__file__), origin / 'start_rl_from_sft.py')
         shutil.copyfile(Path(__file__).with_name('migrate_rl_config_fix.py'), origin / 'migrate_rl_config_fix.py')
         write_json(staging / 'run_config.json', config)
-        migrate_source(repo, staging)
+        for name, content in current_source.items():
+            (staging / 'source' / name).write_bytes(content)
+        write_json(staging / 'source_sha256.json', {name: digest(content) for name, content in current_source.items()})
+        if reevaluate:
+            archived_eval = origin / 'superseded_sft_evaluation'
+            archived_eval.mkdir()
+            for path in list((dest_cat / 'sft').iterdir()):
+                if (path.name == 'eval-sft.complete.json' or path.name.startswith(('eval-', 'valid.', 'test.'))):
+                    path.rename(archived_eval / path.name)
+            write_json(archived_eval / 'reason.json', {
+                'reason': 'Old HF generation config inherited model sampling defaults; rerun deterministic beam50',
+                'use_for_sft_rl_comparison': False})
+            print('Old SFT evaluation archived; rerunning deterministic beam50 before RL. SFT weights are retained.')
         summarize(staging)
         command = launch_command(repo, config, category)
         (staging / 'resume.sh').write_text('#!/usr/bin/env bash\nset -euo pipefail\n'

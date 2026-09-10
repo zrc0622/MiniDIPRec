@@ -2,7 +2,7 @@
 
 本分支提供 `Qwen/Qwen3-0.6B`、最近最多 50 次交互、单机指定四卡的 **Office SFT → 评估 → RL → 评估 → Industrial 同一流程**。两个类别分别从原始 Qwen3 开始；RL 仅继承本类别通过验证集选择的 SFT 模型。方法以官方实际启用的 `sft.py` / `rl.py` 为准，不包含 GPR、TS-Rec 或新增推荐方法。
 
-当前已完成全量数据检查、真实 Qwen3 tokenizer 全任务长度扫描、小模型 SFT/RL/恢复、四进程 CPU 分布式检查。2026-09-10 收到的远端结果中，Office SFT 和评估已完成，测试集 HR@5=0.139334、HR@10=0.165228；RL 在首次更新前因参数 JSON 序列化失败退出，该问题已修复。**本机没有 CUDA GPU，尚未验证修复后的四卡 RL/ZeRO-2/bitsandbytes 路径；Industrial 尚无结果，不能比较 RL 前后效果。** 详细记录见 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md)。
+当前已完成全量数据检查、真实 Qwen3 tokenizer 全任务长度扫描、小模型 SFT/RL/恢复、四进程 CPU 分布式检查。2026-09-10 远端 Office SFT 已完成；最新 micro64 RL 在完成 3 次更新后显存不足。另确认 Qwen3 默认生成参数覆盖了 RL 温度和旧评估的确定性设置，现已修复。**SFT 权重可继续用，旧 SFT 指标须重新评估后才能与修复后的 RL 比较。** 本机无 CUDA GPU，未执行本次修复后的四卡训练/评估；Industrial 尚无结果。详细记录见 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md)。
 
 ## 安装与一键运行
 
@@ -64,7 +64,9 @@ SFT 全模型训练，保留 SID 历史→SID、SID↔title、SID 历史→title
 
 只需设置 `--rl-micro-batch`，梯度累积自动为 `256 / micro`：16→累积16，32→累积8，64→累积4；均为四卡、G16、每次完整更新 1024 个候选。当前先建议 32。增大微批次可能减少循环开销，但 prompt padding 增多也可能抵消收益，未实测 GPU 加速倍数。
 
-**从已有 SFT 重新开始 micro32 RL（用户当前选择）**：先停止占用同一组 GPU 的旧训练，将 `scripts/start_rl_from_sft.py`、`scripts/migrate_rl_config_fix.py` 和已修复的 `minionerec_trainer.py` 同步到服务器仓库。在仓库根目录执行：
+最新 micro64 日志确认在生成候选时 OOM：GPU 2 总显存 44.39 GiB，同卡另一进程占用 9.14 GiB，当前训练占用 33.28 GiB，仅剩 58.12 MiB 时申请 1.54 GiB 失败。前几个短输入能运行不代表长输入也能运行。先回到 micro32；若仍 OOM，再用 micro16。检查方法见 [debug.md](debug.md)。
+
+**从已有 SFT 重新开始 micro32 RL**：先停止自己占用同一组 GPU 的旧训练，将 `scripts/start_rl_from_sft.py`、`scripts/migrate_rl_config_fix.py`、`minionerec_trainer.py` 和 `reproduction/evaluate.py` 的最新版本同步到服务器仓库。在仓库根目录执行：
 
 ```bash
 conda activate minidiprec
@@ -74,15 +76,19 @@ export PATH="$CUDA_HOME/bin:$PATH"
 
 python scripts/start_rl_from_sft.py \
   --source-run qwen3_h50_seed42 \
-  --run-name qwen3_h50_seed42_rl32 \
+  --run-name qwen3_h50_seed42_rl32_fixed \
   --dataset Office_Products --rl-micro-batch 32
 ```
 
-此命令创建新 run，继承源 run 的 GPU、原始模型名、评估设置及 checkpoint 根目录；将已完成的 Office SFT 产物、50 条历史数据及长度扫描结果复制到新结果目录，把验证集选中的 SFT `selected_model` 实体复制到新 checkpoint 目录（不使用软链接）。SFT 不重跑，旧 RL 的权重/优化器/步数不继承，新 RL 从 step 0 开始，完成后自动评估并与已导入 SFT 汇总。旧 run 和旧 RL 不修改。`sft_import/record.json` 记录来源、SFT step、复制文件哈希；大模型权重仍在结果目录外。该入口只运行所选类别的 RL 与评估，不启动 Industrial；后续可用常规入口在新 run 中执行 Industrial 全流程。
+此命令创建新 run，继承源 run 的 GPU、原始模型名、评估设置及 checkpoint 根目录；复制已完成的 Office SFT 产物、50 条历史数据及长度扫描结果，并将验证集选中的 SFT `selected_model` 实体复制到新 checkpoint 目录。SFT 训练不重跑，旧 RL 的权重/优化器/步数不继承，新 RL 从 step 0 开始。如果源 run 使用旧版评估器，脚本自动把旧评估移入新 run 的 `sft_import/superseded_sft_evaluation/`，先重评 SFT valid/test，再启动 RL，最后评估并汇总。旧 run 不修改。
 
-`--prepare-only` 可只导入而不启动训练。新 run 已创建后需要继续运行时，保持 CUDA 环境设置并执行 `bash results/qwen3_h50_seed42_rl32/resume.sh`；无需重复导入。这个脚本只跳过已导入的 SFT，首次运行因新目录没有 RL checkpoint 而从 SFT 开始，之后中断才恢复新 run 自己的 RL checkpoint。打包命令为 `python scripts/package_results.py qwen3_h50_seed42_rl32`。
+若原始 `qwen3_h50_seed42` 已删除，可将 `--source-run` 换成仍保留完整 SFT 产物和模型副本的 `qwen3_h50_seed42_rl32` 或实际的 rl64 run 名称。脚本校验该副本的模型哈希和选中 step，无需最早的 checkpoint 仍存在。`sft_import/record.json` 记录来源及复制文件哈希；大模型权重仍在结果目录外。该入口只运行所选类别；后续可用常规入口在新 run 中执行 Industrial 全流程。
+
+`--prepare-only` 可只导入而不启动训练。新 run 已创建后需要继续运行时，保持 CUDA 环境设置并执行 `bash results/qwen3_h50_seed42_rl32_fixed/resume.sh`；无需重复导入。首次运行从 SFT 开始，之后中断才恢复新 run 自己的 RL checkpoint。打包命令为 `python scripts/package_results.py qwen3_h50_seed42_rl32_fixed`。
 
 **从旧 RL checkpoint 接着训练**时，才使用下面的 batch 迁移流程：
+
+此流程要求源码已一致，或只有旧 dtype 字典复制修复的差异。**它不迁移本次生成参数修复；旧温度 0.6 的 RL 应使用上面的 SFT 导入命令重新开始。** 不要删除源码哈希文件绕过检查。
 
 **已有 run 不能只改启动参数。** Transformers 恢复时会从 `trainer_state.json` 取旧微批次，可能覆盖新配置。先将 `scripts/migrate_rl_batch.py`、`scripts/migrate_rl_config_fix.py` 和已修复的 `minionerec_trainer.py` 同步到服务器，等待完整 checkpoint 保存后停止当前训练；以下操作在服务器仓库根目录执行：
 
@@ -142,23 +148,7 @@ bash scripts/reproduce.sh --run-name gpu_smoke --gpus 0,1,2,3 --max-steps 2
 
 若 `Office_Products/rl/train.log` 报 `TypeError: Object of type dtype is not JSON serializable`，这是首次 RL 更新前记录参数时的错误。trainer 原来原地修改 `model_init_kwargs`，将字符串改成 `torch.dtype`；现改为复制字典后供模型加载使用，模型精度、训练参数、奖励和任务不变。训练结束后的参数记录也因此得到修复。
 
-先将修复后的 `minionerec_trainer.py` 和新增 `scripts/migrate_rl_config_fix.py` 同步到服务器仓库。在训练停止的情况下，使用原环境和运行名执行：
-
-```bash
-conda activate minidiprec
-export CUDA_HOME="$CONDA_PREFIX"
-export CUDA_PATH="$CUDA_HOME"
-export PATH="$CUDA_HOME/bin:$PATH"
-
-# 仅迁移已存在的旧 run；首次运行新 run 无需此步骤
-python scripts/migrate_rl_config_fix.py --run-name qwen3_h50_seed42
-
-# 迁移成功后执行；默认 checkpoint-root 与本次远端实验一致
-bash scripts/reproduce.sh --run-name qwen3_h50_seed42 \
-  --gpus 0,1,2,3 --model Qwen/Qwen3-0.6B --resume
-```
-
-迁移工具只接受这一个配置字典复制修复，拒绝其他源码差异，支持 `--dry-run` 预览。它在 `results/<run_name>/source_migrations/rl_config_copy_v1/` 保留旧源码哈希、修复前后 trainer 和迁移记录，再更新当前源码快照；不修改数据、已有指标或 checkpoint。不要删除源码哈希文件绕过校验。继续运行会跳过 Office 已完成的 SFT 和评估，从对应 SFT 模型开始 RL，随后完成 Industrial 全流程。
+当前代码还包含生成参数修复，应使用上面的 `start_rl_from_sft.py` 新 run 流程保留 SFT、重评并重新开始 RL。历史工具 `migrate_rl_config_fix.py` 仅接受 dtype 这一行差异，无法迁移本次生成参数修复，拒绝其他源码差异属于预期行为。
 
 ## 历史恢复与必要修复
 
@@ -175,6 +165,7 @@ bash scripts/reproduce.sh --run-name qwen3_h50_seed42 \
 5. 官方 RL 入口额外加载 `device_map=auto` 的模型；新入口只由 trainer 加载本 rank 的策略模型与 reference，使用 BF16。TRL generation context 恢复 gradient checkpointing 时会丢失 non-reentrant 设置，已在 backward 前恢复，四进程小模型验证通过。
 6. 为支持用户要求的验证选模，SFT 保留最低 validation loss；RL 以最高 validation ranking reward（exact + rank penalty 之和）选模。RL eval 间隔保留 .0999，save 从 .1 对齐到 .0999；修复 trainer 只把 eval_reward 写日志而不返回的问题，供最佳 checkpoint 选择使用。test 仅在已选择模型上最终评价。
 7. RL checkpoint 增加同步 reference 权重，修复 sampler 在恢复后无法复现对应 epoch 顺序的问题。模型保存仅由主 rank 写，训练日志和状态持续归档。W&B 改为本地记录。
+8. Transformers 4.57.1 会用模型默认值覆盖 `GenerationConfig` 中等于全局默认值的字段。Qwen3 因此把 RL temperature=1 改成 0.6，也把旧评估 do_sample=False 改成 True。生成调用显式传 `use_model_defaults=False`，保留官方 RL beam sampling/temperature=1，统一最终评估为 deterministic beam50。此修复不改变 SFT 训练及基于验证 loss 的选模；旧 SFT 需要重评，旧 RL 需要从 SFT 重启。
 
 SID 映射本身存在碰撞：Office 3459 个 item / 3444 个 SID，Industrial 3686 / 3670。保留官方 SID 命中口径，预测同时写每个 SID 对应的完整 item ID 列表；不宣称模型能区分共享 SID 的 item。
 

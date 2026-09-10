@@ -1,10 +1,22 @@
 # Experiment history
 
+## 2026-09-10 — micro64 OOM 与生成默认值覆盖修复
+
+用户最新 `train.log:803` 确认 micro64/累积4 完成3次更新后，候选生成的 Qwen3 attention 发生 CUDA OOM。GPU 2 总44.39 GiB，另一进程占9.14 GiB，当前训练占33.28 GiB，剩余58.12 MiB时申请1.54 GiB失败。建议回到micro32/累积8，保持有效候选batch1024和G16；长输入和外部任务占用决定能否稳定运行，不根据前几步显存承诺micro64可用。
+
+独立发现并复现 Transformers 4.57.1 的 generation config 合并行为：显式 `GenerationConfig` 中等于全局默认值的字段，仍会被保存的模型默认值覆盖。最新RL日志温度变为0.6；原 `qwen3_h50_seed42/Office_Products/sft/eval-{valid,test}.log` 同时记录 `do_sample=True, temperature=0.6`。**更正此前评估结论：下文保存的 SFT 指标是采样 beam 的历史结果，不是声明的 deterministic beam50 基线，不能与修复后的 RL 直接比较。** 样本、标签、指标计算的既有核验仍成立；SFT 训练及验证 loss 选中的 step378 权重不受影响，无需重训 SFT。
+
+在实际启用的 RL beam 生成调用及统一评估调用显式设置 `use_model_defaults=False`，恢复官方 RL beam sampling/temperature1，最终评估保持 deterministic beam50。此为 Qwen3/Transformers 兼容修复，不是调参。旧RL从SFT重新开始，旧SFT valid/test重评；不根据测试指标选择设置。
+
+更新 `start_rl_from_sft.py`：严格只接受 dtype 复制和本次生成修复差异；原源码及旧评估归档至新 run 的 `sft_import/`，自动重评再训练，原 run 不改写。支持从此前 rl32/rl64 run 的独立 SFT 副本导入，校验模型哈希/step，保留多次导入来源，即使最早 run 已删除也不依赖旧路径。
+
+本地 CPU 回归 **29/29 PASS**，包含真实 ReReTrainer 生成参数检查、真实 Qwen3 tokenizer + 完整 Office catalog beam50、旧评估归档与重评路由、旧源删除后再次导入及篡改拒绝。记录在 `results/generation_fix_20260910/checks/regression.log`。**本机没有 CUDA GPU，未执行修复后的真实 SFT 重评或四卡 RL；未报告新的推荐指标、显存上限或加速倍数。**
+
 ## 2026-09-10 — 从已有 SFT 开始新的 micro32 RL
 
 用户明确改为从 SFT checkpoint 初始化新 RL。新增 `scripts/start_rl_from_sft.py`：在独立 run 中实体复制所选类别已经完成的 SFT 产物、已校验历史数据/长度报告和 SFT selected_model；模型权重放到新 checkpoint 目录。保留原 SFT 参数记录、验证选中 step 及源路径，在 `sft_import/` 保存导入来源和模型/产物哈希。旧 run、旧 RL 训练进度和 checkpoint 均不修改。
 
-入口继续使用原串行 runner：跳过导入的 SFT/评估，仅以对应 SFT 模型初始化所选类别 RL，micro32/accum8，从 step0 开始；新目录不含任何旧 RL checkpoint，实际 RL 训练命令不传 `--resume`。随后执行原统一 valid/test 评估和汇总。新 run 中断后用生成的 `resume.sh` 恢复。默认仅 Office；如需新 run 的 Industrial 全流程，另用常规入口指定该类别并保留相同配置。
+此版本入口继续使用原串行 runner：跳过导入的 SFT/评估，仅以对应 SFT 模型初始化所选类别 RL，micro32/accum8，从 step0 开始；新目录不含任何旧 RL checkpoint，实际 RL 训练命令不传 `--resume`。随后执行 valid/test 评估和汇总。后续发现生成默认值覆盖问题，当前版本导入旧结果时会先重评 SFT，见上方更正。新 run 中断后用生成的 `resume.sh` 恢复。默认仅 Office；如需新 run 的 Industrial 全流程，另用常规入口指定该类别并保留相同配置。
 
 新增导入与命令路由测试：验证旧产物哈希不变、模型真实复制、无旧 RL 目录、只启动一条 RL 训练和两条评估命令、不向 RL 传续训标志；缺模型/目标目录冲突拒绝、复制失败清理。测试首次发现 macOS `/var` 与 `/private/var` 规范路径差异引起配置校验不匹配，已统一新 checkpoint 根目录的绝对路径。**本机无 GPU，也未收到服务器 SFT 权重；未执行真实模型复制或新的四卡 RL。**
 
@@ -23,6 +35,8 @@
 ## 2026-09-10 — 远端 Office SFT 结果与 RL 初始化修复
 
 检查用户提供的 `results/qwen3_h50_seed42/`。Office SFT 在 step 504（epoch 6.07248）正常早停：step 378 验证 loss 最低为 1.3855953216552734，后续 step 420/462/504 连续三次未改善。评估与 RL 初始化使用该验证集选出的模型，checkpoint 路径记录在 `Office_Products/sft/training.json`，服务器默认目录为 `checkpoints/qwen3_h50_seed42/Office_Products/sft/`。
+
+以下为旧采样评估的历史数值，待 deterministic beam50 重评后替换正式对比基线：
 
 | 数据集 / 阶段 | split | 样本数 | HR/Recall@5 | HR/Recall@10 | NDCG@5 | NDCG@10 |
 |---|---|---|---|---|---|---|

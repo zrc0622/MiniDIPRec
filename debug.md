@@ -1,5 +1,23 @@
 # 四卡复现环境排查
 
+## 最新：micro64 RL 显存不足（2026-09-10）
+
+本次 `train.log:803` 的首个致命错误为 `torch.OutOfMemoryError`：完成 3 次更新后，在生成候选的 Qwen3 attention 中申请 1.54 GiB 失败。GPU 2 总容量 44.39 GiB，剩余 58.12 MiB；另一进程 PID 3492676 占 9.14 GiB，本训练进程占 33.28 GiB。运行中的输入长度会变化，仅看前几步的显存不能判断 micro64 稳定。
+
+在服务器检查当前占用（PID 可能已变化）：
+
+```bash
+nvidia-smi -i 0,1,2,3
+nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv
+ps -p 3492676 -o pid,user,etime,args
+```
+
+先使用 micro32/累积8，四卡有效 batch 仍为 1024；若仍 OOM，可使用 micro16/累积16。其他任务需由其所有者安排释放显存，不要直接杀掉未知进程。可在启动前尝试 `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 缓解碎片，但不能保证 micro64 可运行。`GradientAccumulationPlugin has 1 ... DeepSpeed ... 4` 已说明采用 DeepSpeed 的4，不是本次退出原因；后续析构 `IndexError`、`ChildFailedError` 是连带错误。此时无需重装 CUDA。
+
+同时发现独立的生成参数问题：日志中的 `generation_config ... {'temperature': 0.6}` 表明 RL 温度被 Qwen3 默认值覆盖；旧 SFT eval 日志还显示 `do_sample: True`。已在 RL 和评估的生成调用加入 `use_model_defaults=False`。SFT 权重不需重训，旧 SFT 评估需要重新执行，RL 从 SFT 重新开始。请同步最新代码后按 [README 的 SFT 导入命令](README.md#显存允许时提高-rl-微批次) 创建新 run；脚本自动归档旧评估、重评 SFT，再启动 RL。源 run 和已有历史 CSV 保留。
+
+下面各节保留之前缺 `nvcc` 的环境排查。已有 run 源码不一致时不能直接用旧 `--resume` 命令绕过；本次生成修复使用上述新 run 导入流程。
+
 在 **Linux GPU 服务器**上执行以下命令。先激活训练环境并进入仓库；路径、环境名和 GPU 编号按实际情况修改。下面默认使用 GPU `0,1,2,3`。
 
 ```bash

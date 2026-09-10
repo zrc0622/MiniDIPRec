@@ -25,6 +25,13 @@ def metrics(rows):
     return {'samples': len(rows), **scores}
 
 
+def generate_candidates(model, inputs, conf, processors):
+    # Qwen's saved defaults include do_sample=True and temperature=0.6. Without
+    # this flag, HF >=4.50 overwrites even explicit default-valued config fields.
+    return model.generate(**inputs, generation_config=conf,
+                          logits_processor=processors, use_model_defaults=False)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--model', required=True)
@@ -75,8 +82,8 @@ def main():
             width = inputs.input_ids.shape[1]
             if width > limits['eval_prompt_max']:
                 raise ValueError('Evaluation prompt exceeds scanned length')
-            generated = model.generate(**inputs, generation_config=conf,
-                logits_processor=LogitsProcessorList([trie.processor(width)]))
+            generated = generate_candidates(model, inputs, conf,
+                LogitsProcessorList([trie.processor(width)]))
             text = tokenizer.batch_decode(generated.sequences[:, width:], skip_special_tokens=True)
             scores = generated.sequences_scores.tolist()
             for j, row in enumerate(batch):
