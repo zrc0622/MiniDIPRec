@@ -2,7 +2,7 @@
 
 本分支提供 `Qwen/Qwen3-0.6B`、最近最多 50 次交互、单机指定四卡的 **Office SFT → 评估 → RL → 评估 → Industrial 同一流程**。两个类别分别从原始 Qwen3 开始；RL 仅继承本类别通过验证集选择的 SFT 模型。方法以官方实际启用的 `sft.py` / `rl.py` 为准，不包含 GPR、TS-Rec 或新增推荐方法。
 
-当前已完成全量数据检查、真实 Qwen3 tokenizer 全任务长度扫描、小模型 SFT/RL/恢复、四进程 CPU 分布式检查。2026-09-10 远端 Office SFT 已完成；最新 micro64 RL 在完成 3 次更新后显存不足。另确认 Qwen3 默认生成参数覆盖了 RL 温度和旧评估的确定性设置，现已修复。**SFT 权重可继续用，旧 SFT 指标须重新评估后才能与修复后的 RL 比较。** 本机无 CUDA GPU，未执行本次修复后的四卡训练/评估；Industrial 尚无结果。详细记录见 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md)。
+当前已完成全量数据检查、真实 Qwen3 tokenizer 全任务长度扫描、小模型 SFT/RL/恢复、四进程 CPU 分布式检查。2026-09-10 远端 Office SFT 已完成；micro64和micro32 RL分别在完成3、21次更新后显存不足。另确认 Qwen3 默认生成参数覆盖了 RL 温度和旧评估的确定性设置，现已修复。**SFT 权重可继续用，旧 SFT 指标须重新评估后才能与修复后的 RL 比较。** 本机无 CUDA GPU，未执行本次修复后的四卡训练/评估；Industrial 尚无结果。详细记录见 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md)。
 
 ## 安装与一键运行
 
@@ -62,11 +62,13 @@ SFT 全模型训练，保留 SID 历史→SID、SID↔title、SID 历史→title
 
 ### 显存允许时提高 RL 微批次
 
-只需设置 `--rl-micro-batch`，梯度累积自动为 `256 / micro`：16→累积16，32→累积8，64→累积4；均为四卡、G16、每次完整更新 1024 个候选。当前先建议 32。增大微批次可能减少循环开销，但 prompt padding 增多也可能抵消收益，未实测 GPU 加速倍数。
+只需设置 `--rl-micro-batch`，梯度累积自动为 `256 / micro`：16→累积16，32→累积8，64→累积4；均为四卡、G16、每次完整更新 1024 个候选。最新日志显示当前共享GPU环境中32也发生OOM，建议先回到16。增大微批次可能减少循环开销，但 prompt padding 增多也可能抵消收益，未实测 GPU 加速倍数。
 
 最新 micro64 日志确认在生成候选时 OOM：GPU 2 总显存 44.39 GiB，同卡另一进程占用 9.14 GiB，当前训练占用 33.28 GiB，仅剩 58.12 MiB 时申请 1.54 GiB 失败。前几个短输入能运行不代表长输入也能运行。先回到 micro32；若仍 OOM，再用 micro16。检查方法见 [debug.md](debug.md)。
 
-**从已有 SFT 重新开始 micro32 RL**：先停止自己占用同一组 GPU 的旧训练，将 `scripts/start_rl_from_sft.py`、`scripts/migrate_rl_config_fix.py`、`minionerec_trainer.py` 和 `reproduction/evaluate.py` 的最新版本同步到服务器仓库。在仓库根目录执行：
+micro32随后在21次更新后也发生OOM：反向传播申请4.78 GiB，GPU 2剩余2.76 GiB，外部进程仍占9.14 GiB。下面命令改用micro16；不保证所有长输入都能在当前共享显存下稳定运行。
+
+**从已有 SFT 重新开始 micro16 RL**：先停止自己占用同一组 GPU 的旧训练，将 `scripts/start_rl_from_sft.py`、`scripts/migrate_rl_config_fix.py`、`minionerec_trainer.py` 和 `reproduction/evaluate.py` 的最新版本同步到服务器仓库。在仓库根目录执行：
 
 ```bash
 conda activate minidiprec
@@ -76,15 +78,15 @@ export PATH="$CUDA_HOME/bin:$PATH"
 
 python scripts/start_rl_from_sft.py \
   --source-run qwen3_h50_seed42 \
-  --run-name qwen3_h50_seed42_rl32_fixed \
-  --dataset Office_Products --rl-micro-batch 32
+  --run-name qwen3_h50_seed42_rl16_fixed \
+  --dataset Office_Products --rl-micro-batch 16
 ```
 
 此命令创建新 run，继承源 run 的 GPU、原始模型名、评估设置及 checkpoint 根目录；复制已完成的 Office SFT 产物、50 条历史数据及长度扫描结果，并将验证集选中的 SFT `selected_model` 实体复制到新 checkpoint 目录。SFT 训练不重跑，旧 RL 的权重/优化器/步数不继承，新 RL 从 step 0 开始。如果源 run 使用旧版评估器，脚本自动把旧评估移入新 run 的 `sft_import/superseded_sft_evaluation/`，先重评 SFT valid/test，再启动 RL，最后评估并汇总。旧 run 不修改。
 
 若原始 `qwen3_h50_seed42` 已删除，可将 `--source-run` 换成仍保留完整 SFT 产物和模型副本的 `qwen3_h50_seed42_rl32` 或实际的 rl64 run 名称。脚本校验该副本的模型哈希和选中 step，无需最早的 checkpoint 仍存在。`sft_import/record.json` 记录来源及复制文件哈希；大模型权重仍在结果目录外。该入口只运行所选类别；后续可用常规入口在新 run 中执行 Industrial 全流程。
 
-`--prepare-only` 可只导入而不启动训练。新 run 已创建后需要继续运行时，保持 CUDA 环境设置并执行 `bash results/qwen3_h50_seed42_rl32_fixed/resume.sh`；无需重复导入。首次运行从 SFT 开始，之后中断才恢复新 run 自己的 RL checkpoint。打包命令为 `python scripts/package_results.py qwen3_h50_seed42_rl32_fixed`。
+`--prepare-only` 可只导入而不启动训练。新 run 已创建后需要继续运行时，保持 CUDA 环境设置并执行 `bash results/qwen3_h50_seed42_rl16_fixed/resume.sh`；无需重复导入。首次运行从 SFT 开始，之后中断才恢复新 run 自己的 RL checkpoint。打包命令为 `python scripts/package_results.py qwen3_h50_seed42_rl16_fixed`。
 
 **从旧 RL checkpoint 接着训练**时，才使用下面的 batch 迁移流程：
 

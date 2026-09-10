@@ -1,6 +1,14 @@
 # 四卡复现环境排查
 
-## 最新：micro64 RL 显存不足（2026-09-10）
+## 最新：micro32 RL 在 backward 中 OOM（2026-09-10 14:37）
+
+新上传日志确认累积为8，完成21次更新后在 `backward()` 中申请4.78 GiB失败。GPU 2 总44.39 GiB，剩余2.76 GiB；外部PID 3492676仍占9.14 GiB，本训练进程占30.85 GiB，其中PyTorch已分配23.82 GiB、保留但未分配6.14 GiB。栈只定位到反向传播，无法据此确定具体算子；缓存碎片可能参与，但日志不足以证明只有碎片问题。
+
+当前建议 micro16/累积16，四卡有效batch仍为1024、G仍为16；这是现有入口支持的配置，无需修改trainer。可在启动前设置 `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 缓解碎片，仍不能保证所有长输入都不会OOM。先用下面的 `nvidia-smi` 命令核实其他任务占用。
+
+该日志仍显示温度被覆盖成0.6，说明该次运行未使用生成参数修复。同步README列出的最新文件后，使用SFT导入命令，将新名字设为 `qwen3_h50_seed42_rl16_fixed`、参数设为 `--rl-micro-batch 16`。保留SFT训练权重；旧版评估自动归档重评；从SFT开始新的RL。已完成修正版SFT评估的run也可作为来源，避免重复评估。完整新日志归档于 `results/oom_rl32_20260910/checks/remote_train.log`；尚未验证micro16的四卡显存稳定性。
+
+## 前次：micro64 RL 显存不足（2026-09-10）
 
 本次 `train.log:803` 的首个致命错误为 `torch.OutOfMemoryError`：完成 3 次更新后，在生成候选的 Qwen3 attention 中申请 1.54 GiB 失败。GPU 2 总容量 44.39 GiB，剩余 58.12 MiB；另一进程 PID 3492676 占 9.14 GiB，本训练进程占 33.28 GiB。运行中的输入长度会变化，仅看前几步的显存不能判断 micro64 稳定。
 

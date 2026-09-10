@@ -1,5 +1,11 @@
 # Experiment history
 
+## 2026-09-10 — micro32 反向传播 OOM
+
+用户更新的日志在14:37:42退出：DeepSpeed采用梯度累积8，完成21次更新后 `backward()` 申请4.78 GiB失败。GPU 2容量44.39 GiB，空闲2.76 GiB，外部进程3492676仍占9.14 GiB，本训练进程占30.85 GiB。与前次micro64在生成时OOM不同，本次栈仅定位到反向传播，无法确定具体算子或断言只有碎片问题。
+
+该日志仍有 `generation_config ... temperature: 0.6`，因此不是修复后的RL运行。建议同步生成修复后从SFT启动micro16/累积16，有效batch1024及G16不变；可尝试 `expandable_segments:True` 缓解碎片。此次未改trainer、奖励或生成算法。README/debug已更新，远端原日志归档在 `results/oom_rl32_20260910/checks/remote_train.log`。本机无CUDA，未执行micro16四卡容量验证，也没有新的完整RL指标。
+
 ## 2026-09-10 — micro64 OOM 与生成默认值覆盖修复
 
 用户最新 `train.log:803` 确认 micro64/累积4 完成3次更新后，候选生成的 Qwen3 attention 发生 CUDA OOM。GPU 2 总44.39 GiB，另一进程占9.14 GiB，当前训练占33.28 GiB，剩余58.12 MiB时申请1.54 GiB失败。建议回到micro32/累积8，保持有效候选batch1024和G16；长输入和外部任务占用决定能否稳定运行，不根据前几步显存承诺micro64可用。
