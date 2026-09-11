@@ -13,6 +13,8 @@ venv/
 # Generated experiment artifacts (including packaged results)
 /results/
 /results.zip
+# Imported server run kept beside results/ for read-only provenance
+/qwen3_h50_seed42_rl16_fixed/
 /__MACOSX/
 /checkpoints/
 /output/

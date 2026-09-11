@@ -1,5 +1,36 @@
 # Experiment history
 
+## 2026-09-11 — 已保存 RL checkpoint 的验证集诊断入口
+
+新增 `scripts/evaluate_checkpoints.py` / `.sh`，默认串行比较 Office SFT 基线与 RL 175、350、1400、1575 步。复用校验通过的 SFT 和选中步数的现有验证预测，其余 checkpoint 使用原 `reproduction.evaluate`、四个指定 GPU、BF16、确定性 beam50；仅验证集，不启动训练、不读取测试集指标、不改原选模与汇总。新增代码位于 scripts，训练/评估源码及原 run 指纹不变。
+
+先检查原评估源码快照、valid 数据/catalog/长度指纹，再逐行核验复用预测的覆盖率、目标、历史、候选合法性及指标重算。正式推理前检查 checkpoint 的模型分片、tokenizer 和 global_step；记录权重 SHA256。诊断配置、源码/输入快照、命令/环境日志、逐样本预测及汇总保存在该 run 类别下的 `diagnostics/checkpoint_validation/`，不复制权重、不创建软链接。复用 selected_model 结果的步数关联来自原 training.json，明确标注未字节比对导出与 checkpoint 权重。
+
+同命令重跑校验并跳过已完成项，中断项从验证集开头重评；文件锁避免同目录并发写入，变更配置需独立 diagnostic-name。支持指定步数、迁移后的 checkpoint 根目录、评估 batch 和强制重评 selected 模型。汇总附原训练的 eval_reward 和相对 SFT 指标差值，SFT 基线记为 RL step0，另记原 SFT step378；不会根据此次诊断自动替换原模型。
+
+本地定向 CPU 回归 **13/13 PASS**（8 项新增诊断测试、5 项已有 SFT 导入回归），覆盖串行 valid-only/four-GPU 路由、复用、恢复、数据/源码/预测篡改拒绝、缺模型/错误 step 拒绝、完整分片检查、并发锁及权重目录迁移。真实 Office 产物 dry-run 校验已有两组验证预测通过，确认只需新增175/350/1575推理。**本机没有 CUDA 或服务器权重，未执行新增 checkpoint 的真实 GPU 评估；没有新增推荐指标或选模结论。**
+
+## 2026-09-11 — Office micro16 fixed 完成与负结果审计
+
+用户提供 `qwen3_h50_seed42_rl16_fixed/` 完整产物，已实体复制到 `results/qwen3_h50_seed42_rl16_fixed/`；原目录不改，加入gitignore避免上传数据。4×L40、Torch2.6+cu124、DeepSpeed0.18，micro16/累积16/G16，有效batch1024。RL完成1746step/2epochs，训练含中间验证耗时17.80小时，按最高eval_reward选中1400step。SFT保留原378step权重并使用fixed重评。
+
+| split | 阶段 | HR/Recall@5 | HR/Recall@10 | NDCG@5 | NDCG@10 |
+|---|---|---:|---:|---:|---:|
+| valid | SFT | 0.206535 | 0.232635 | 0.180333 | 0.188749 |
+| valid | SFT+RL | 0.194616 | 0.213933 | 0.168188 | 0.174388 |
+| test | SFT | 0.139334 | 0.165023 | 0.115878 | 0.124228 |
+| test | SFT+RL | 0.132141 | 0.150226 | 0.109252 | 0.115154 |
+
+14份源码快照、6份生成文件及官方源数据哈希核验通过。valid/test的SFT和RL共19464条预测，样本覆盖、history/target、SID/item映射、50个唯一合法候选、排序和指标重算通过。完整评估参数一致，RL训练日志无0.6覆盖或OOM，结尾析构异常发生在训练完成后。配置与命令确认从SFT新启RL，四卡限制及batch设置一致；没有服务器模型权重，无法独立比较selected_model与checkpoint1400的字节内容。
+
+测试HR@10净少72次（803→731，相对-8.97%）：丢失170条，新增98条；丢失中83条落到11～50名、87条不在Top50。历史≤10样本贡献净损失71条，历史>10贡献1条。目标在历史出现的样本净+9，未出现的样本净-81。预测Top10全局SID覆盖2138→2455，不能简单归因于输出少数商品。fixed重评相对旧SFT采样评估的HR@10仅少1次，无法解释RL净少72次。
+
+最需进一步排查的是早期优化稳定性：step114日志KL估计值993168.81、loss993.9177，step116日志grad_norm198695.48。这个KL是官方指数概率比的采样估计，不是精确全目录KL；梯度范数也不能直接视为裁剪后的更新范数。九次验证reward近乎持平，1400step相对175step只高1.08%，exact奖励相同。当前选择的是采样G16综合奖励最佳，不保证确定性beam50 Recall/NDCG最佳，且初始SFT不参与RL checkpoint选择。
+
+本次只分析已存在的产物，没有改训练/奖励/超参数，没有根据test调整模型。用户分组配对bootstrap显示该模型对在当前测试用户样本上HR@10差值95%区间约[-2.136,-0.824]个百分点；不代表跨训练seed结论。建议下一步仅在valid评估已有checkpoint，判断退化发生时间及选模指标是否一致；GPU检查和逐token KL追踪均尚未执行。
+
+完整报告、复查脚本、配对排名CSV、验证曲线CSV、PNG/PDF图位于 `results/qwen3_h50_seed42_rl16_fixed/analysis_20260911/`。原101份文件已逐一哈希确认复制一致。仅收到Office结果，Industrial尚未完成。
+
 ## 2026-09-10 — micro32 反向传播 OOM
 
 用户更新的日志在14:37:42退出：DeepSpeed采用梯度累积8，完成21次更新后 `backward()` 申请4.78 GiB失败。GPU 2容量44.39 GiB，空闲2.76 GiB，外部进程3492676仍占9.14 GiB，本训练进程占30.85 GiB。与前次micro64在生成时OOM不同，本次栈仅定位到反向传播，无法确定具体算子或断言只有碎片问题。

@@ -2,7 +2,7 @@
 
 本分支提供 `Qwen/Qwen3-0.6B`、最近最多 50 次交互、单机指定四卡的 **Office SFT → 评估 → RL → 评估 → Industrial 同一流程**。两个类别分别从原始 Qwen3 开始；RL 仅继承本类别通过验证集选择的 SFT 模型。方法以官方实际启用的 `sft.py` / `rl.py` 为准，不包含 GPR、TS-Rec 或新增推荐方法。
 
-当前已完成全量数据检查、真实 Qwen3 tokenizer 全任务长度扫描、小模型 SFT/RL/恢复、四进程 CPU 分布式检查。2026-09-10 远端 Office SFT 已完成；micro64和micro32 RL分别在完成3、21次更新后显存不足。另确认 Qwen3 默认生成参数覆盖了 RL 温度和旧评估的确定性设置，现已修复。**SFT 权重可继续用，旧 SFT 指标须重新评估后才能与修复后的 RL 比较。** 本机无 CUDA GPU，未执行本次修复后的四卡训练/评估；Industrial 尚无结果。详细记录见 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md)。
+当前已完成全量数据检查、真实 Qwen3 tokenizer 全任务长度扫描、小模型 SFT/RL/恢复、四进程 CPU 分布式检查。2026-09-11 收到远端 Office micro16 fixed 完整结果：RL完成1746步，按验证奖励选中1400步；在相同确定性beam50评估下，测试HR@10由0.165023降至0.150226、NDCG@10由0.124228降至0.115154，验证集也下降。已核验源码/数据哈希和19464条预测，训练前期存在KL估计值与梯度尖峰，尚不能确定单一原因。此前Qwen3生成参数覆盖已修复，本次SFT已重评。**本机无CUDA，未独立执行GPU推理或checkpoint权重复核；Industrial尚无结果，不宣称RL必然提升。** 详细记录见 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md)。完整分析在本地 `results/qwen3_h50_seed42_rl16_fixed/analysis_20260911/report.md`。
 
 ## 安装与一键运行
 
@@ -151,6 +151,58 @@ bash scripts/reproduce.sh --run-name gpu_smoke --gpus 0,1,2,3 --max-steps 2
 若 `Office_Products/rl/train.log` 报 `TypeError: Object of type dtype is not JSON serializable`，这是首次 RL 更新前记录参数时的错误。trainer 原来原地修改 `model_init_kwargs`，将字符串改成 `torch.dtype`；现改为复制字典后供模型加载使用，模型精度、训练参数、奖励和任务不变。训练结束后的参数记录也因此得到修复。
 
 当前代码还包含生成参数修复，应使用上面的 `start_rl_from_sft.py` 新 run 流程保留 SFT、重评并重新开始 RL。历史工具 `migrate_rl_config_fix.py` 仅接受 dtype 这一行差异，无法迁移本次生成参数修复，拒绝其他源码差异属于预期行为。
+
+## 用已有 checkpoint 诊断 RL 的验证集表现
+
+在服务器上串行评估已保存的 RL checkpoint，不重新训练、不重新处理历史数据。默认比较 SFT 基线和 RL 的 175、350、1400、1575 步；SFT 和训练选中步数（本次为 1400）的已有验证结果通过核验后直接复制复用，因此本次实际只需重新推理三个 checkpoint。统一使用原 `reproduction.evaluate` 的确定性 beam50，输出 HR/Recall@5、@10、NDCG@5、@10，以及相对 SFT 的差值和对应训练期间的 `eval_reward`。
+
+同步新增的 `scripts/evaluate_checkpoints.py` 和 `scripts/evaluate_checkpoints.sh` 后，在服务器执行：
+
+```bash
+conda activate minidiprec
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+
+cd /data/zuorongchang/project/MiniDIPRec
+bash scripts/evaluate_checkpoints.sh \
+  --run-name qwen3_h50_seed42_rl16_fixed \
+  --dataset Office_Products --gpus 0,1,2,3
+```
+
+该脚本只调用 `--split valid`，不读取测试集样本或指标，不改写原 `selected_model`、训练配置、完成标记和顶层测试汇总；新增文件也不会改变原 runner 的训练源码指纹。验证结果用于诊断“是否较早下降”和“采样奖励与确定性排名指标是否一致”，不会自动替换原实验选中的模型。复用的 RL 1400 结果来自 `training.json` 标明该步导出的 `selected_model`，没有重新比较两个目录的权重字节。
+
+参数和恢复方式：
+
+- `--dry-run`：只核验现有结果、打印计划和所需 checkpoint 路径；不写文件、不加载模型。缺失权重会明确显示，正式执行会在 GPU 推理前报错。
+- `--steps 175 350 525 700 875 1050 1225 1400 1575`：检查更多已保存步数。不要填写已删除的 checkpoint；SFT 基线始终包含。
+- `--checkpoint-root /path/to/large_disk/minionerec_checkpoints`：权重移动后指定根目录，其下应包含 `<run_name>/<dataset>/rl/checkpoint-<step>/`；默认使用原 `run_config.json` 记录的路径。
+- `--batch-size 1`：评估显存不足时降低每卡评估批次；默认沿用原值 2，和 RL 训练 micro batch 无关。
+- 中断后直接重跑**同一条命令**：校验并跳过已完成项；未完成的 checkpoint 从验证集开头重算，不续算其部分预测。
+- 修改步数、batch、GPU 或其他诊断配置后，增加 `--diagnostic-name checkpoint_validation_v2` 写入另一目录。
+- `--reevaluate-selected --diagnostic-name checkpoint_validation_fresh`：也重新评估 SFT `selected_model` 和请求列表中的 RL 选中 checkpoint，需对应权重仍存在。
+
+脚本核验当前评估源码与实验快照一致，校验准备好的 valid CSV、SID 映射及长度报告，再校验复用预测的覆盖率、行标签、50 个合法候选和指标重算。新推理记录权重 SHA256，检查完整 checkpoint/tokenizer 和 step，强制只看到指定四卡，禁用 Hugging Face 在线下载。全部产物是普通文件；模型权重仍留在 checkpoint 目录。
+
+输出位于 `results/<run_name>/<dataset>/diagnostics/checkpoint_validation/`：
+
+```text
+config.json, commands.jsonl, commands.sh, environment.log
+source/, inputs/                           # 评估源码及 valid 输入/配置快照
+summary.md, summary.csv, summary.json       # 仅验证集诊断汇总
+sft/, checkpoint-175/, checkpoint-350/, ...
+  valid.predictions.jsonl, valid.metrics.json
+  provenance.json, complete.json
+  eval-valid.log                           # 实际重新推理的 checkpoint 才有
+```
+
+训练内 `eval_reward` 使用 G16 采样候选，不能直接当作 beam50 的 Recall/NDCG。汇总明确区分 SFT 训练步数（378）和 RL 进度（SFT 基线记为 0）。打包包含诊断结果的整个 run：
+
+```bash
+python scripts/package_results.py qwen3_h50_seed42_rl16_fixed
+```
+
+本地已完成 CPU 编排/恢复/完整性检查及真实 Office 产物的 dry-run；**本机没有 CUDA 和服务器 checkpoint，尚未执行新增 checkpoint 的真实四卡推理**。
 
 ## 历史恢复与必要修复
 
