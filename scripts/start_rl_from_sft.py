@@ -84,7 +84,7 @@ def launch_command(repo, config, category):
         '--max-steps', str(config['max_steps']), '--resume']
 
 
-def create_run(repo, source_run, run_name, category, micro_batch=32):
+def create_run(repo, source_run, run_name, category, micro_batch=32, *, short_config=None):
     repo = Path(repo).resolve()
     for name in (source_run, run_name):
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name):
@@ -108,9 +108,11 @@ def create_run(repo, source_run, run_name, category, micro_batch=32):
             or checkpoint_root == source or source in checkpoint_root.parents):
         raise ValueError('Checkpoint root must be outside the results directories')
     cat = source / category
-    for name in ('sft.complete.json', 'eval-sft.complete.json', 'training.json',
-                 'valid.metrics.json', 'test.metrics.json',
-                 'valid.predictions.jsonl', 'test.predictions.jsonl'):
+    required_artifacts = ['sft.complete.json', 'eval-sft.complete.json', 'training.json',
+                          'valid.metrics.json', 'valid.predictions.jsonl']
+    if short_config is None:
+        required_artifacts += ['test.metrics.json', 'test.predictions.jsonl']
+    for name in required_artifacts:
         if not (cat / 'sft' / name).is_file():
             raise ValueError(f'Completed SFT and evaluation required: {cat / "sft" / name}')
     training = json.loads((cat / 'sft/training.json').read_text())
@@ -152,6 +154,10 @@ def create_run(repo, source_run, run_name, category, micro_batch=32):
     reevaluate = 'reproduction/evaluate.py' in changed_source
     config = dict(config, run_name=run_name, checkpoint_root=str(checkpoint_root),
                   rl_micro_batch=micro_batch, rl_accumulation=256 // micro_batch)
+    if short_config is not None:
+        # Extra key deliberately makes the normal all-stage runner reject this run.
+        config['rl_short'] = short_config
+        config['gpus'] = short_config['gpus']
     checkpoint_root.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix='.sft-import-', dir=root.parent))
     checkpoint_staging = Path(tempfile.mkdtemp(prefix='.sft-import-', dir=checkpoint_root.parent))
@@ -214,8 +220,28 @@ def create_run(repo, source_run, run_name, category, micro_batch=32):
                 'reason': 'Old HF generation config inherited model sampling defaults; rerun deterministic beam50',
                 'use_for_sft_rl_comparison': False})
             print('Old SFT evaluation archived; rerunning deterministic beam50 before RL. SFT weights are retained.')
-        summarize(staging)
-        command = launch_command(repo, config, category)
+        if short_config is None:
+            summarize(staging)
+            command = launch_command(repo, config, category)
+        else:
+            # Retain imported test results only as historical provenance. A short
+            # validation experiment must not present them as its own evaluation.
+            historical = origin / 'historical_sft_test'
+            for path in list((dest_cat / 'sft').iterdir()):
+                if path.name.startswith('test.') or path.name == 'eval-test.log':
+                    historical.mkdir(exist_ok=True)
+                    path.rename(historical / path.name)
+            command = [sys.executable, str(repo / 'scripts/run_rl_short.py'),
+                       '--run-name', run_name, '--resume']
+            (staging / 'summary.md').write_text('RL short experiment: validation only; no results yet.\n')
+            names = ['scripts/run_rl_short.py', 'scripts/train_rl_short.py',
+                     'scripts/start_rl_from_sft.py', 'scripts/migrate_rl_config_fix.py',
+                     'scripts/evaluate_checkpoints.py', 'scripts/evaluate_checkpoints.sh']
+            for name in names:
+                target = staging / 'short_source' / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(repo / name, target)
+            write_json(staging / 'short_source_sha256.json', {name: sha256(repo / name) for name in names})
         (staging / 'resume.sh').write_text('#!/usr/bin/env bash\nset -euo pipefail\n'
             + 'cd ' + shlex.quote(str(repo)) + '\n' + shlex.join(command) + '\n')
         checkpoint_staging.rename(checkpoint_root)

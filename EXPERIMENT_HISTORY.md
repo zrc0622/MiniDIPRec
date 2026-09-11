@@ -1,5 +1,45 @@
 # Experiment history
 
+## 2026-09-11 — 保留完整调度的短 RL 验证入口
+
+用户希望缩短训练步数快速检查效果。新增 `scripts/run_rl_short.py` / `train_rl_short.py`，默认提前停止350个优化器更新步，保存50/100/175/350；使用原ReReTrainer、三类RL任务、exact+ranking奖励、G16、temperature1、beta .001、paged AdamW和reference同步。完整2epoch/cosine/warmup3%调度保持，未用max_steps压缩调度；原周期采样验证照常，新快照只保存。为避免删除新增诊断checkpoint，保留上限增加。没有新增attention/约束解码加速。
+
+学习率作为显式参数，默认仍1e-5，文档给出5e-6的新run单参数适配实验。此为待验证建议，不是issue #5提供的已证实解法。源SFT/历史50数据/长度报告实体复制并核验；源RL不继承，源run不改。现有 `reproduction/*.py`、trainer、四卡官方配置指纹不变；原SFT导入入口增加可选短跑元数据/归档分支，常规入口行为不变。
+
+训练后只用完整验证集，以同一beam50设置重新评估SFT及所有请求快照，记录相对SFT的HR/Recall/NDCG差值；不进行测试集评价或替换原选模。顶层汇总仅验证结果，旧SFT测试结果归档。支持prepare/train/eval分阶段和同run恢复；在最终checkpoint已经保存的情况下从其状态补齐记录，不多训练一步。配置变更拒绝续跑，独立记录新增脚本指纹和来源，权重仍在结果目录外。
+
+本地定向CPU测试 **26/26 PASS**，原fixed run的14个核心源码哈希完全一致，`git diff --check`通过。真实tiny Qwen3 + ReReTrainer完整/短跑初始LR序列相等，停止在指定global_step且scheduler总步数不变；模拟保存后中断，恢复后模型及reference权重与连续短跑逐项一致；预算已到时拒绝再更新。其余回归覆盖原配置字段对齐、独立SFT副本/源run不变、参数校验、仅验证集路由、恢复幂等及源码变更拒绝。**无CUDA、无服务器权重，未执行350步真实GPU训练和新的推荐评估指标。**
+
+## 2026-09-11 — 结合上游 issue 排查 RL 下降原因
+
+阅读用户提供的issues.md（六段有内容、末尾第七段为空，编号是用户整理编号；未联网验证讨论/PR状态），区分Owner回复与其他用户观察。第六段Owner明确解释exact+负rank penalty、全错组奖励归零，与当前官方奖励实现一致。当前1746次训练日志均候选多样性1、completion长度5，reward/grad_norm非零；与issue中的空EOS/重复输出/全零梯度不同。关键依赖版本也匹配官方requirements，已修复generation默认值覆盖，不建议无证据重装或把RL改成确定性生成。
+
+按G16唯一候选估算，训练每更新有奖励命中组的比例中位约34.4%，验证约22.1%～22.8%；两者口径不同，训练混合三类任务。全错组虽无推荐奖励优势，仍可贡献KL项，不能说完全不影响训练。推导并核验一组仅第j名命中时的平均reward为w_j/(16Σw)，正负抵消使原始reward较小，不代表命中率0.2%或无梯度。43条舍入loss0也不能视为故障。
+
+结合175步已经退化、113～116步KL/梯度尖峰与未见item目标损失，当前优先假说为前期优化漂移、KL/数值尾部以及稀疏奖励下的任务信号差异，未确定因果。issue中“主要改beta，指标到0.0996”未提供beta值/方向，0.0996不能当作beta建议。1400在本次四个RL checkpoint中仍NDCG10最高，选模错误降为次要怀疑。独立Preference Summarization未启用、RL description任务存在是代码事实，是否解释论文差距仅为用户推测；本轮不增删任务。
+
+额外核验：实际自定义ReReTrainer的compute_loss并不使用序列化GRPOConfig的loss_type/epsilon分支，入口dapo=False/gspo=False；不能把它当作现代TRL GRPOTrainer解读。当前有意保留官方trainer。完整对照、建议的逐token/分任务判别检查、原issue副本和可复查统计在 `results/qwen3_h50_seed42_rl16_fixed/Office_Products/diagnostics/issues_analysis_20260911/`。未更改训练代码/超参数、未新增GPU实验或测试集选模。
+
+## 2026-09-11 — 收到 checkpoint 验证结果：前175步已退化
+
+收到 `diagnostics/checkpoint_validation/`，46个文件实体复制至原run类别下的diagnostics目录并校验SHA一致，原传入目录保留并加入gitignore。6份评估/脚本源码、9份输入快照与原run匹配；五组共24330条验证预测全量核验通过，generation config完全一致。175/350/1575均有四卡valid-only命令、日志和完成标志；每次约6分钟。SFT/1400与原验证预测字节一致。未执行新的训练或本地GPU推理。
+
+| 模型 | valid HR/Recall@10 | valid NDCG@10 | Top10命中数 |
+|---|---:|---:|---:|
+| SFT | 0.232635 | 0.188749 | 1132 |
+| RL175 | 0.211673 | 0.172099 | 1030 |
+| RL350 | 0.211262 | 0.170102 | 1028 |
+| RL1400（原选中） | 0.213933 | 0.174388 | 1041 |
+| RL1575 | 0.214139 | 0.173798 | 1042 |
+
+175步约为总更新的10%，此时HR@10净少102次命中；175→1400仅净回升11次。早期丢失的178条Top10命中中，128条到1400仍未恢复。1400仍为这四个RL模型中HR@5/NDCG@5/NDCG@10最高者，1575的HR@10只多1次。因此此前“选模指标不一致”不能作为本次下降的主要已证实解释；观察更支持前期退化后未充分恢复，未证明单一因果关系。
+
+前113～116步KL/grad_norm尖峰处于0～175的未评估区间，需优先调查但不能据此认定BF16/裁剪错误。175也早于首次512步reference同步，第一次同步不能解释已存在的175退化。未评估其余五个RL checkpoint，不能宣称整个训练所有checkpoint均不如SFT。
+
+配对用户bootstrap（1795用户、2000次、seed42）四个RL对SFT的四项指标逐项区间均负；175→1400的HR10/NDCG10区间跨0。仅为当前模型对和验证用户的不确定性，不代表跨训练seed结论。分组显示1400净损失91中85来自历史≤10；重复目标净+8、未见目标净-99。未据此调参或改原测试汇总。
+
+分析代码、报告、JSON/逐样本CSV与PNG/PDF保存在 `results/qwen3_h50_seed42_rl16_fixed/Office_Products/diagnostics/checkpoint_analysis_20260911/`。模型哈希记录一致性已核验，本地无权重，无法独立重算服务器模型哈希或比对selected_model与1400权重。
+
 ## 2026-09-11 — 已保存 RL checkpoint 的验证集诊断入口
 
 新增 `scripts/evaluate_checkpoints.py` / `.sh`，默认串行比较 Office SFT 基线与 RL 175、350、1400、1575 步。复用校验通过的 SFT 和选中步数的现有验证预测，其余 checkpoint 使用原 `reproduction.evaluate`、四个指定 GPU、BF16、确定性 beam50；仅验证集，不启动训练、不读取测试集指标、不改原选模与汇总。新增代码位于 scripts，训练/评估源码及原 run 指纹不变。

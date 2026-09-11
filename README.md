@@ -4,6 +4,8 @@
 
 当前已完成全量数据检查、真实 Qwen3 tokenizer 全任务长度扫描、小模型 SFT/RL/恢复、四进程 CPU 分布式检查。2026-09-11 收到远端 Office micro16 fixed 完整结果：RL完成1746步，按验证奖励选中1400步；在相同确定性beam50评估下，测试HR@10由0.165023降至0.150226、NDCG@10由0.124228降至0.115154，验证集也下降。已核验源码/数据哈希和19464条预测，训练前期存在KL估计值与梯度尖峰，尚不能确定单一原因。此前Qwen3生成参数覆盖已修复，本次SFT已重评。**本机无CUDA，未独立执行GPU推理或checkpoint权重复核；Industrial尚无结果，不宣称RL必然提升。** 详细记录见 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md)。完整分析在本地 `results/qwen3_h50_seed42_rl16_fixed/analysis_20260911/report.md`。
 
+补充 checkpoint 验证：收到服务器175/350/1575步评估后，五组共24330条验证预测核验通过。175步Recall@10已从SFT的0.232635降至0.211673，1400步仅恢复到0.213933；1400仍是本次四个RL checkpoint中NDCG@10最高者。现有证据更支持早期退化后未充分恢复，未证明具体原因。详细报告在 `results/qwen3_h50_seed42_rl16_fixed/Office_Products/diagnostics/checkpoint_analysis_20260911/report.md`；此次未改变训练方法或原模型选择。
+
 ## 安装与一键运行
 
 Linux、Python 3.11、4 张支持 BF16 的 NVIDIA GPU；建议从官方使用的 A100/H100 级设备开始。以下安装 CUDA 12.4 的 PyTorch 2.6 wheel，需匹配宿主驱动。命令均在仓库根目录执行。
@@ -59,6 +61,51 @@ bash scripts/reproduce.sh --run-name qwen3_h50_seed42 \
 SFT 全模型训练，保留 SID 历史→SID、SID↔title、SID 历史→title 任务；Fusion 的 description 分支原本未启用，保持关闭。RL 保留 SID 历史→SID、title/description→SID、随机抽取 10,000 条 title 历史→SID；抽样沿用官方 pandas `random_state=0`，整体 shuffle/训练 seed=42。保留 `add_gt=False`、`dynamic_sampling=False`、`test_during_training=False`、`dapo=False`、`gspo=False`。
 
 可用 `--sft-micro-batch 8 --rl-micro-batch 32` 适配显存，累积自动计算，仍保持 batch 1024；RL micro 必须为 16 的倍数，低于 16 会明确拒绝。每张卡的候选生成必须持有完整的 G=16 组。默认评估 batch 为 2，可通过 `--eval-batch-size` 调整。各 epoch 的不足整批尾部沿用官方 Trainer/Accelerate 行为，可能有补齐和不足完整累积更新；批大小等价指正常完整更新。
+
+### 从已有 SFT 做 350 步 RL 快速验证
+
+原 Office 实验在175步时已出现下降，可以先检查前350步，无需每次跑满1746步。这个实验用于观察早期退化是否减轻，不能证明完整训练有效或无效。下面只把RL学习率从原 `1e-5` 改为 `5e-6`，其他训练方法保持一致；这是参数适配实验，原官方配置入口不变，issue #5 本身没有给出已验证的修复参数。
+
+同步最新代码后，在服务器仓库根目录运行（源run需保留SFT模型副本）：
+
+```bash
+conda activate minidiprec
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+python scripts/run_rl_short.py \
+  --source-run qwen3_h50_seed42_rl16_fixed \
+  --run-name qwen3_h50_seed42_rl_lr5e6_short350 \
+  --dataset Office_Products --gpus 0,1,2,3 \
+  --rl-micro-batch 16 --learning-rate 5e-6 \
+  --stop-after-steps 350 --snapshot-steps 50 100 175 350
+```
+
+脚本实体复制选中的SFT模型、已处理的历史50数据及长度报告；校验已有数据后复用，不重新重建历史或重训SFT。RL优化器、scheduler、reference从SFT重新初始化，不加载源run的RL。权重放在源checkpoint根目录下的新run同级目录；旧run不改。
+
+`--stop-after-steps` 计数的是**优化器更新步**。仍按完整2epochs计算scheduler（当前Office为1746步，warmup53步），到350步提前停止；**不要替换成 `--max-steps 350`**，后者会压缩学习率曲线。G16、四卡micro16×累积16、有效候选batch1024、beta .001、任务/奖励/优化器及reference同步规则均保持。原每约10%的采样验证/保存照常；50/100等新增点只保存checkpoint，不插入采样验证，不改变训练随机数序列。为保留新增快照，checkpoint保留数量上限相应增加。
+
+训练停止后，四张卡串行评估SFT（RL step0）及50/100/175/350快照，统一使用原确定性beam50、**完整验证集**，输出HR/Recall@5、@10、NDCG@5、@10及相对SFT差值。本次也重新评估SFT，避免沿用导入结果中的旧模型路径；不运行测试集评价、不修改原run的模型选择或测试汇总。当前服务器每组验证约6分钟，五组额外约30分钟；350步训练粗估3～4小时，受共享GPU和保存开销影响。
+
+中断后沿用保存配置继续，不重复导入：
+
+```bash
+bash results/qwen3_h50_seed42_rl_lr5e6_short350/resume.sh
+```
+
+也可执行 `python scripts/run_rl_short.py --run-name qwen3_h50_seed42_rl_lr5e6_short350 --resume`。完成的训练和已校验的评估会跳过；未完成训练恢复**新run自身**的最新完整RL checkpoint（包含reference），最后一步已保存但进程退出时只补齐记录，不再多训练一步。更改LR/步数/微批次应换新run，不能修改已有配置后续跑。该实验使用独立入口，不要用 `reproduce.sh` 恢复短跑。
+
+单阶段：首次命令加 `--stage prepare` 仅复制/校验；随后用 `--run-name ... --resume --stage train` 仅训练，`--stage eval` 仅评估。`--snapshot-steps` 可选；默认保存不超过停止预算的50/100/175步以及最后一步。不传学习率时保持官方默认 `1e-5`，可用于短跑对照。
+
+产物在 `results/<run_name>/`：顶层 `summary.md/csv/json` 是验证集对比；`Office_Products/rl/` 保存训练日志、逐步指标、实际scheduler预算及checkpoint路径/step；`Office_Products/diagnostics/short_validation/` 保存每个模型的验证预测、指标、命令及评估日志。配置和源码快照随run保留；导入的旧SFT测试结果仅归档至 `sft_import/`，不进入新汇总。打包给分析时执行：
+
+```bash
+python scripts/package_results.py qwen3_h50_seed42_rl_lr5e6_short350
+```
+
+本地已用真实小型Qwen3/ReReTrainer进行CPU学习率前缀、停止和断点恢复验证；本机没有CUDA，**此350步实验的真实四卡训练/指标尚未执行**。
 
 ### 显存允许时提高 RL 微批次
 

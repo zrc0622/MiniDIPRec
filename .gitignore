@@ -15,6 +15,7 @@ venv/
 /results.zip
 # Imported server run kept beside results/ for read-only provenance
 /qwen3_h50_seed42_rl16_fixed/
+/diagnostics/
 /__MACOSX/
 /checkpoints/
 /output/
