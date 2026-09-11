@@ -1,5 +1,23 @@
 # Experiment history
 
+## 2026-09-11 — A/B/C 串行175步初筛入口
+
+用户授权三组短跑：A beta=.04/sample=True，B beta=.001/sample=False，C beta=.04/sample=False；LR均1e-5。新增 `scripts/run_rl_abc.py`，默认每组175更新、保存50/100/175，原完整2epoch cosine/warmup调度不变。选择175以覆盖已观察到的113～116步尖峰和baseline首个下降评估点，短跑只作早期筛查，不代表最终效果。
+
+在独立短跑入口增加beta/候选采样显式选项，默认仍 .001/True；通过trainer实例的GenerationConfig设置候选模式，不修改共享ReReTrainer或原 `reproduction/*.py`。记录实际beta/采样/beam数/temperature；HF `use_model_defaults=False`仍有效。关闭采样时仍为G16完整beam候选，适用于训练及原G16验证奖励；后续排名评估统一确定性beam50。任务/奖励/优化器/reference同步/有效batch1024/attention均保持。旧短跑脚本指纹不自动迁移。
+
+三组先导入并校验相同SFT权重、step、数据和长度，再A训练→验证→B训练→验证→C训练→验证，使用同四卡。支持单阶段、同命令重跑及checkpoint恢复，错误停止后续组。完成的结果逐组实体复制入套件目录，含日志/配置/源码/预测/指标/权重路径，自动跨组汇总，一条package_results命令即可打包，无软链接和模型权重。数据校验后复用，不重训SFT，不运行测试集或更改原选模。
+
+本地定向CPU回归 **32/32 PASS**：包括三种实际tiny Qwen3/ReReTrainer的采样开关未被Qwen默认覆盖、两个输入各16个唯一合法SID候选/标签分组、有限且非零梯度、原调度前缀/停止/恢复，以及串行顺序、源run不变、失败后不启动C、数据/SFT不一致拒绝、普通文件副本、重复运行与参数变更拒绝。额外端到端脚本测试模拟GPU子进程，实际执行准备/训练记录收尾/逐样本指标核验/三组汇总及tar打包；完成后重跑无GPU调用，打包内含三组预测、无软链接和权重。Python解析、README的21段Bash语法、git whitespace检查通过；核心文件相对HEAD未修改。验证日志在 `results/abc_script_validation_20260911/checks/tests.log`。真实GPU训练、ZeRO2/paged AdamW与推荐指标尚未执行；本机无CUDA。
+
+## 2026-09-11 — 对照 MiniOneRec-Enhanced 的 RL 增益记录
+
+只读审阅本地Enhanced commit2fd7042：脚本确实使用Qwen3-0.6B，Amazon23 Industrial，自建Balanced RQ-KMeans SID3/4层、原始历史10。作者聚合表记录SFT→Ranking的测试HR10 .060447→.066262、NDCG10 .048873→.052984；First-Diff另有增益。当前有效配方不同：beta .04、确定性beam16、候选batch128、三任务各10000、1epoch3750、adamw_torch。MONITORING_LOG记载早期beta.001也出现KL尖峰，之后改beta和生成方式；缺少原始日志/权重/run源码快照，无法独立复核历史配置或归因单一修改。
+
+Enhanced报告测试冷启动8494/16163=52.55%，收益偏冷启动、部分中高频损失。按训练history+target集合统一定义直接统计本run Office：valid36/4866=.740%、test58/4866=1.192%；只描述既有数据分布，没有新增测试评估/选模。两套官方SID均3层，Enhanced的第4层结束冲突不适用。源码还保留训练/验证history2target合并覆盖风险，未获其数据不能量化；文档的surrogate ratio爆炸因果说明也与活跃损失不符。
+
+完整差异、证据边界和单变量验证建议在 `results/qwen3_h50_seed42_rl16_fixed/Office_Products/diagnostics/enhanced_comparison_20260911/`，含14份源码副本、哈希、聚合指标与可重复统计脚本。本轮没有更改训练实现/参数、没有启动GPU实验。
+
 ## 2026-09-11 — 保留完整调度的短 RL 验证入口
 
 用户希望缩短训练步数快速检查效果。新增 `scripts/run_rl_short.py` / `train_rl_short.py`，默认提前停止350个优化器更新步，保存50/100/175/350；使用原ReReTrainer、三类RL任务、exact+ranking奖励、G16、temperature1、beta .001、paged AdamW和reference同步。完整2epoch/cosine/warmup3%调度保持，未用max_steps压缩调度；原周期采样验证照常，新快照只保存。为避免删除新增诊断checkpoint，保留上限增加。没有新增attention/约束解码加速。

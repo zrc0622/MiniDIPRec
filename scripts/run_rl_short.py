@@ -27,6 +27,9 @@ def parser():
     p.add_argument('--gpus', help='Exactly four GPU IDs; default: source run')
     p.add_argument('--rl-micro-batch', type=int)
     p.add_argument('--learning-rate', type=float, help='Default 1e-5 (official); use 5e-6 for the proposed LR check')
+    p.add_argument('--beta', type=float, help='KL coefficient; default 0.001 (official)')
+    p.add_argument('--do-sample', action=argparse.BooleanOptionalAction, default=None,
+                   help='RL beam candidate sampling; default enabled. Use --no-do-sample for deterministic beams')
     p.add_argument('--stop-after-steps', type=int, help='Optimizer updates, default 350; full scheduler retained')
     p.add_argument('--snapshot-steps', type=int, nargs='+', help='Default 50 100 175, within budget; final step always saved')
     p.add_argument('--resume', action='store_true', help='Use stored settings and resume this short run only')
@@ -43,6 +46,11 @@ def validate_short(config):
     lr, micro = config['learning_rate'], config['rl_micro_batch']
     if not math.isfinite(lr) or lr <= 0:
         raise ValueError('Learning rate must be positive and finite')
+    beta = config.get('beta', 0.001)
+    if not math.isfinite(beta) or beta <= 0:
+        raise ValueError('Beta must be positive and finite (reference KL remains enabled)')
+    if not isinstance(config.get('do_sample', True), bool):
+        raise ValueError('do_sample must be a boolean')
     if micro < 16 or micro % 16 or 256 % micro:
         raise ValueError('RL micro batch must be a multiple of G16 dividing 256')
     devices = config['gpus'].split(',')
@@ -54,12 +62,16 @@ def setup_run(repo, args):
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', args.run_name):
         raise ValueError('Run name must be a simple directory name')
     root = repo / 'results' / args.run_name
-    keys = ('source_run', 'dataset', 'gpus', 'rl_micro_batch', 'learning_rate', 'stop_after_steps', 'snapshot_steps')
+    keys = ('source_run', 'dataset', 'gpus', 'rl_micro_batch', 'learning_rate', 'beta', 'do_sample',
+            'stop_after_steps', 'snapshot_steps')
     if args.resume:
         config = evaluation.read_json(root / 'run_config.json')
         short = config.get('rl_short')
         if short is None:
             raise ValueError('This is not a short RL run; choose a new run name with --source-run')
+        # Old short runs still face their strict source check; defaults are only
+        # for interpreting their stored recipe, never a source-check bypass.
+        short = {'beta': 0.001, 'do_sample': True, **short}
         for key in keys:
             value = getattr(args, key)
             if key == 'snapshot_steps' and value is not None:
@@ -80,6 +92,8 @@ def setup_run(repo, args):
                  'gpus': args.gpus if args.gpus is not None else source['gpus'],
                  'rl_micro_batch': args.rl_micro_batch if args.rl_micro_batch is not None else 16,
                  'learning_rate': args.learning_rate if args.learning_rate is not None else 1e-5,
+                 'beta': args.beta if args.beta is not None else 0.001,
+                 'do_sample': args.do_sample if args.do_sample is not None else True,
                  'stop_after_steps': stop, 'snapshot_steps': sorted(set(snapshots) | {stop}),
                  'schedule': 'original 2 epochs, cosine, warmup_ratio=0.03; max_steps=-1',
                  'evaluation': 'valid only; beam50; no final test or new selection rule'}
@@ -122,6 +136,8 @@ def training_command(repo, root, config, short, resume=None):
                '--data', str(cat / 'data'), '--category', short['dataset'], '--output', str(weights / 'rl'),
                '--artifacts', str(cat / 'rl'), '--lengths', str(cat / 'lengths.json'),
                '--micro-batch', str(short['rl_micro_batch']), '--learning-rate', str(short['learning_rate']),
+               '--beta', str(short.get('beta', 0.001)),
+               '--do-sample' if short.get('do_sample', True) else '--no-do-sample',
                '--stop-after-steps', str(short['stop_after_steps']),
                '--snapshot-steps', *map(str, short['snapshot_steps'])]
     if resume:
@@ -205,6 +221,11 @@ def run(repo, args, launcher=evaluation.launch):
                 raise ValueError('Complete the short training stage before evaluation')
             plan = validation_plan(repo, root, config, short)
             evaluation.execute_plan(repo, plan, launcher)
+            # The unchanged evaluator's generic wording assumes beam sampling.
+            # Record the actual G16 mode for these explicitly varied experiments.
+            summary = Path(plan['output']) / 'summary.md'
+            summary.write_text(summary.read_text().replace('训练期间 G16 采样奖励',
+                f"训练期间 G16 {'采样' if short.get('do_sample', True) else '确定性 beam'}奖励"))
             for extension in ('md', 'csv', 'json'):
                 shutil.copyfile(Path(plan['output']) / f'summary.{extension}', root / f'summary.{extension}')
             print(f'Validation only: {root / "summary.md"}', flush=True)

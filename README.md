@@ -62,7 +62,71 @@ SFT 全模型训练，保留 SID 历史→SID、SID↔title、SID 历史→title
 
 可用 `--sft-micro-batch 8 --rl-micro-batch 32` 适配显存，累积自动计算，仍保持 batch 1024；RL micro 必须为 16 的倍数，低于 16 会明确拒绝。每张卡的候选生成必须持有完整的 G=16 组。默认评估 batch 为 2，可通过 `--eval-batch-size` 调整。各 epoch 的不足整批尾部沿用官方 Trainer/Accelerate 行为，可能有补齐和不足完整累积更新；批大小等价指正常完整更新。
 
-### 从已有 SFT 做 350 步 RL 快速验证
+### 串行运行 A/B/C：每组先验证 175 步
+
+针对 Enhanced 的两个配置差异，新增三个独立的短跑实验。三组均从同一个选中的 SFT checkpoint 开始，学习率保持 `1e-5`；这是参数适配实验，原官方复现入口的默认参数不变。
+
+| 实验 | beta | RL do_sample | 改动 |
+|---|---:|---|---|
+| 已有 baseline（不重跑） | 0.001 | True | 当前原配方 |
+| A | 0.04 | True | 加强 KL 约束 |
+| B | 0.001 | False | 确定性 beam 候选 |
+| C | 0.04 | False | 两项一起改 |
+
+关闭 `do_sample` 仍使用16 beams生成16个候选，继续计算组内奖励并更新模型；并非单候选训练。该设置作用于训练和原trainer的G16中间验证奖励，最终排名评估始终为确定性beam50。**beta增大或关闭采样不保证提升，也不保证消除KL尖峰。**
+
+同步代码后，在服务器仓库根目录执行：
+
+```bash
+conda activate minidiprec
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+python scripts/run_rl_abc.py \
+  --source-run qwen3_h50_seed42_rl16_fixed \
+  --run-name qwen3_h50_abc175 \
+  --dataset Office_Products --gpus 0,1,2,3 \
+  --rl-micro-batch 16 --stop-after-steps 175
+```
+
+脚本先实体复制三组SFT模型、已处理数据及长度报告并校验三者一致；只校验复用历史50数据，不重建、不重训SFT。随后严格串行执行 **A训练→A验证→B训练→B验证→C训练→C验证**，复用指定四卡。三组都从同一SFT重新初始化优化器、scheduler和reference，不继承前一组RL。每组micro16×累积16×4卡，有效候选batch1024；奖励、任务配比、优化器、reference同步及attention实现保持原设置。
+
+默认每组175个优化器更新，保存50/100/175；保留完整2epoch的cosine调度和warmup（当前Office共1746步、warmup53步）。175覆盖已有baseline的113～116步尖峰与第一个已评估的下降点，适合初筛；**不代表完整训练结论**。新增快照只保存、不插入额外G16验证，原约10%的中间验证仍照常。每组训练结束后评估SFT和三个快照，全部使用完整验证集，输出HR/Recall@5/@10、NDCG@5/@10；不运行测试集，不自动替换selected_model。
+
+若更急，可换新名字并指定 `--stop-after-steps 100`，默认只保存50/100；但100尚未覆盖此前113～116步的尖峰。只想看停止点可加 `--snapshot-steps 175` 减少保存和评估开销，代价是缺少早期曲线。不要用 `--max-steps` 替代提前停止预算。
+
+中断后重跑**完全相同的命令**，或：
+
+```bash
+bash results/qwen3_h50_abc175/resume.sh
+```
+
+会跳过完成的训练，校验并跳过完成的评估；未完成组从自身最新完整RL checkpoint恢复，出错时停止后续组。`--stage prepare/train/eval` 分别用于仅准备、仅训练、仅验证；默认 `all`。改步数/GPU/微批次等设置需新run-name。单组可用 `run_rl_short.py --beta 0.04 --no-do-sample ...`，未指定时仍为beta .001和采样开启。本次修改了短跑脚本指纹，旧版本创建的短跑应使用原代码恢复；常规fixed源run的14个核心文件未改，不需要迁移其SFT。
+
+运行中的三个独立目录为 `results/qwen3_h50_abc175_A`、`_B`、`_C`；权重位于源checkpoint根目录的同级新run目录，始终在results外。套件每完成一组就将日志/配置/源码/预测等实体复制至下列目录，并刷新跨组汇总；套件可独立复制分析：
+
+```text
+results/qwen3_h50_abc175/
+  abc_config.json, shared_sft.json, commands.jsonl, resume.sh
+  summary.md, summary.csv, summary.json
+  A.log, B.log, C.log
+  Office_Products/A/                 # B/、C/结构相同；普通文件副本
+    run_config.json, sft_import/, source/, short_source/
+    Office_Products/rl/              # train.log、candidate_config、scheduler、checkpoint路径/step
+    Office_Products/diagnostics/short_validation/  # 逐样本验证预测及指标
+```
+
+分析副本不替代原 `_A/_B/_C` 工作目录用于断点恢复；确认不再续训后才考虑清理工作目录。一条命令打包三组（不包含权重）：
+
+```bash
+python scripts/package_results.py qwen3_h50_abc175
+```
+
+本地已验证三组真实tiny Qwen3/ReReTrainer的候选模式、G16分组及反向传播，并通过调度/恢复和串行脚本回归；**本机无CUDA，未执行这三组的真实四卡训练/评估，尚无新推荐指标。**
+
+### 从已有 SFT 做单组 350 步 RL 快速验证
 
 原 Office 实验在175步时已出现下降，可以先检查前350步，无需每次跑满1746步。这个实验用于观察早期退化是否减轻，不能证明完整训练有效或无效。下面只把RL学习率从原 `1e-5` 改为 `5e-6`，其他训练方法保持一致；这是参数适配实验，原官方配置入口不变，issue #5 本身没有给出已验证的修复参数。
 

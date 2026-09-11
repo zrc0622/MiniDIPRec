@@ -43,6 +43,8 @@ class ShortRunTests(unittest.TestCase):
             short = config['rl_short']
             self.assertEqual(short['snapshot_steps'], [50, 100, 175, 350])
             self.assertEqual(short['learning_rate'], 5e-6)
+            self.assertEqual(short['beta'], 0.001)
+            self.assertIs(short['do_sample'], True)
             self.assertEqual(config['rl_accumulation'], 16)
             self.assertEqual(config['gpus'], '2,3,6,7')
             self.assertFalse((root / CATEGORIES[0] / 'sft/test.metrics.json').exists())
@@ -52,6 +54,8 @@ class ShortRunTests(unittest.TestCase):
             command = runner.training_command(repo, root, config, short)
             self.assertNotIn('--max-steps', command)
             self.assertNotIn('--resume', command)
+            self.assertIn('--do-sample', command)
+            self.assertEqual(command[command.index('--beta') + 1], '0.001')
             self.assertEqual(Path(command[command.index('--model') + 1]).name, 'selected_model')
             self.assertIn('run_rl_short.py', (root / 'resume.sh').read_text())
             resume = runner.parser().parse_args(['--run-name', 'short', '--resume', '--stage', 'prepare'])
@@ -62,6 +66,11 @@ class ShortRunTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Cannot change learning_rate'):
                 runner.setup_run(repo, resume)
             resume.learning_rate = None
+            for field, value in [('beta', 0.04), ('do_sample', False)]:
+                setattr(resume, field, value)
+                with self.assertRaisesRegex(ValueError, f'Cannot change {field}'):
+                    runner.setup_run(repo, resume)
+                setattr(resume, field, None)
             with (repo / 'scripts/train_rl_short.py').open('a') as f:
                 f.write('# unexpected edit\n')
             with self.assertRaisesRegex(ValueError, 'Source changed'):
@@ -73,6 +82,7 @@ class ShortRunTests(unittest.TestCase):
             for field, value in [('stop_after_steps', 0), ('snapshot_steps', [351]),
                                  ('snapshot_steps', [50, 50]), ('rl_micro_batch', 24),
                                  ('rl_micro_batch', 0), ('learning_rate', float('nan')),
+                                 ('beta', 0), ('beta', float('inf')),
                                  ('gpus', '0,1,2')]:
                 original = getattr(args, field)
                 setattr(args, field, value)
@@ -134,10 +144,79 @@ class ShortScheduleTests(unittest.TestCase):
         expected, actual = fields(original), fields(short)
         self.assertEqual(expected.keys(), actual.keys())
         adapted = {'output_dir', 'per_device_train_batch_size', 'per_device_eval_batch_size',
-                   'gradient_accumulation_steps', 'learning_rate', 'max_steps'}
+                   'gradient_accumulation_steps', 'learning_rate', 'beta', 'max_steps'}
         for key in expected.keys() - adapted:
             self.assertEqual(ast.dump(expected[key]), ast.dump(actual[key]), key)
         self.assertEqual(ast.literal_eval(actual['max_steps']), -1)
+        import inspect
+        from scripts.train_rl_short import rl_config
+        self.assertEqual(inspect.signature(rl_config).parameters['beta'].default, ast.literal_eval(expected['beta']))
+
+    def test_abc_real_generation_groups_and_backward(self):
+        import torch
+        from datasets import Dataset
+        from transformers import set_seed
+        from trl import GRPOConfig
+        from minionerec_trainer import ReReTrainer
+        from reproduction.contracts import ranking_rewards
+        from scripts.train_rl_short import configure_candidates
+        from tests.test_reproduction_runtime import RuntimeTests
+        torch.set_num_threads(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / 'model'
+            base.mkdir()
+            set_seed(42)
+            tok, model, sids, info = RuntimeTests().fixture(base)
+            # Deliberately hostile inherited Qwen defaults must not win.
+            model.generation_config.do_sample = True
+            model.generation_config.temperature = 0.6
+            model.save_pretrained(base)
+            rows = [{'prompt': '### Response:\n' + suffix, 'target': sids[i] + '\n',
+                     'sample_id': str(i)} for i, suffix in enumerate(('', 'hello'))]
+            for label, beta, sample in [('A', .04, True), ('B', .001, False), ('C', .04, False)]:
+                with self.subTest(label=label):
+                    conf = GRPOConfig(output_dir=str(Path(tmp) / label), use_cpu=True, bf16=False,
+                        per_device_train_batch_size=32, per_device_eval_batch_size=32,
+                        num_generations=16, temperature=1., beta=beta, max_completion_length=5,
+                        gradient_checkpointing=False, report_to='none')
+                    conf.max_prompt_length = 64
+                    seen = []
+                    def reward(prompts, completions, target, **kwargs):
+                        self.assertEqual(len(completions), 32)
+                        for start in (0, 16):
+                            self.assertEqual(len(set(prompts[start:start + 16])), 1)
+                            self.assertEqual(len(set(target[start:start + 16])), 1)
+                            self.assertEqual(len(set(completions[start:start + 16])), 16)
+                            self.assertTrue(all(c.rstrip() in sids for c in completions[start:start + 16]))
+                        seen.append(completions)
+                        return ranking_rewards(completions, target)[0]
+                    trainer = ReReTrainer(model=str(base), base_model=str(base), processing_class=tok,
+                        args=conf, train_dataset=Dataset.from_list(rows), reward_funcs=[reward],
+                        beam_search=True, test_during_training=False, info_file=str(info))
+                    recorded = configure_candidates(trainer, sample)
+                    self.assertEqual(recorded['beta'], beta)
+                    actual = []
+                    original = trainer.model._prepare_generation_config
+                    def capture(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        actual.append(result[0])
+                        return result
+                    inputs = [rows[0]] * 16 + [rows[1]] * 16
+                    with patch.object(trainer.model, '_prepare_generation_config', side_effect=capture):
+                        prepared = trainer._prepare_inputs(inputs)
+                    self.assertEqual(actual[0].do_sample, sample)
+                    self.assertEqual(actual[0].temperature, 1.)
+                    self.assertEqual(actual[0].num_return_sequences, 16)
+                    # Set controlled fixture targets to valid generated candidates,
+                    # then test a real reward advantage and backward pass.
+                    rows[0]['target'], rows[1]['target'] = seen[0][0], seen[0][16]
+                    prepared = trainer._prepare_inputs(inputs)
+                    loss = trainer.compute_loss(trainer.model, prepared)
+                    self.assertTrue(torch.isfinite(loss))
+                    loss.backward()
+                    gradients = [p.grad for p in trainer.model.parameters() if p.grad is not None]
+                    self.assertTrue(all(torch.isfinite(g).all() for g in gradients))
+                    self.assertTrue(any(g.abs().sum() > 0 for g in gradients))
 
     def test_real_rl_schedule_prefix_and_interrupted_resume(self):
         import torch
