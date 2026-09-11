@@ -126,6 +126,49 @@ python scripts/package_results.py qwen3_h50_abc175
 
 本地已验证三组真实tiny Qwen3/ReReTrainer的候选模式、G16分组及反向传播，并通过调度/恢复和串行脚本回归；**本机无CUDA，未执行这三组的真实四卡训练/评估，尚无新推荐指标。**
 
+### 六组串行实验：所有 RL 固定 350 步
+
+在服务器仓库根目录、原四卡训练环境中执行：
+
+```bash
+python scripts/run_rl_six.py \
+  --run-name qwen3_six350 \
+  --source-run qwen3_h50_seed42_rl16_fixed \
+  --gpus 0,1,2,3
+```
+
+前五组从同一 history50 SFT step378 独立初始化。共同配置以已有 C 为基准：LR `1e-5`、beta `.04`、确定性 beam、G16、micro16 × 累积16 × 4卡，候选 batch1024。每组仅作表中变化：
+
+| 顺序 / 目录 | 变化 | RL 更新步 | 每步输入组 / 候选数 |
+|---|---|---:|---:|
+| `01_lr5e6` | LR 降至 `5e-6` | 350 | 64 / 1024 |
+| `02_beta01` | beta 增至 `.1` | 350 | 64 / 1024 |
+| `03_batch128` | 累积改为2，候选 batch128 | 350 | 8 / 128 |
+| `04_equal_tasks` | 三类 RL 任务等量采样 | 350 | 64 / 1024 |
+| `05_g32` | G32，micro32，累积16 | 350 | 64 / 2048 |
+| `06_history10` | 原始 Qwen3 → history10 SFT → RL | 350 | 64 / 1024 |
+
+严格按1→6串行：先共享 SFT50 验证，然后逐组 RL→快照验证；到第六组才重训 SFT10、验证 SFT10，再 RL→快照验证。六组 RL 合计2100次优化器更新，第六组 **SFT不受350步限制**，沿用10 epochs、LR3e-4、全局batch1024、warmup20、每5%验证保存、patience3，选验证loss最小的模型。三列 item/SID/title 输入历史同步截为最近10条，样本、标签和数据划分保持一致；先用真实 tokenizer 扫描所有启用的 train/valid 任务长度。需要源run的 SFT 权重，以及已缓存的原始 `Qwen/Qwen3-0.6B`；本地原始基座路径可用 `--base-model /path/to/Qwen3-0.6B` 指定。
+
+第4组保持训练行数55842，以seed42在各任务内打乱、循环抽取，各18614条；因此改变任务权重而不同时缩短数据集。它不是 Enhanced 三任务各10000条的完整复刻。第5组保持每步64个输入组，候选计算量翻倍；micro32的显存需求也高于micro16，脚本不会失败后自行换配方。
+
+**350指优化器更新次数，不是 `max_steps=350` 压缩调度。** 保留之前方案按输入样本量对齐的完整 cosine/reference 节奏：Office普通组调度1746步、warmup53、reference间隔512；小batch组调度13968步、warmup424、reference间隔4096。因此第3组只见2800个输入组，其他组见22400个，且第3组350步全部在warmup内。这轮是固定更新预算的初筛，不能据此得出等样本预算或完整 Enhanced 训练结论。
+
+每组保存并在完整验证集评估50/100/175/350，统一确定性beam50。前五组共享一次SFT基线评估，第六组比较自己的SFT10，共26次验证；不自动评估test。每组仍记录原间隔的内部G16/G32验证奖励，新增快照只保存，不插入额外训练期验证。汇总在 `results/qwen3_six350/summary.md`（另有CSV/JSON），包含相对各自SFT的HR10、NDCG10变化和实际样本预算。
+
+同一命令重新运行即可恢复；也可使用生成的命令：
+
+```bash
+bash results/qwen3_six350/resume.sh
+python scripts/package_results.py qwen3_six350
+```
+
+完成的训练/评估经校验后跳过，未完成RL从本组最新含reference的checkpoint恢复；350已保存时只补记录，不增加更新。失败停止后续组。`--dry-run` 只显示六组配置，不复制文件、不访问模型权重；`--stage prepare/train/eval` 支持分阶段；`--experiments 1 2` 可执行子集，仍按数字顺序。配置、数据、代码指纹锁定，改变配方需新run-name。`--checkpoint-root` 指定新suite权重的父目录，默认与源run同级。
+
+新的results采用紧凑布局：源码/原始来源只存一次，两套history数据各存一份，六组结果直接写在suite内；权重、优化器、reference均放在results外。保留每步结构化标量、关键配置/哈希、完整验证指标及预测；预测保存为无损 `.jsonl.gz`，核验解压后SHA256再移除新生成的未压缩副本。每个子进程普通控制台仅保留末尾256KiB，警告/错误末尾64KiB。真实Office预测抽查从14.1MB压至3.8MB（约减少73%）。旧results约1.39GB，其中普通log仅10.9MB，主要占用是重复预测和数据；此次不改写旧结果及其清单。
+
+CPU验证覆盖真实tiny Qwen3的G32生成/奖励/反向传播、调度停止及恢复权重一致、四rank采样布局、串行路由、压缩核验和打包。实际四卡CUDA、ZeRO2/paged AdamW运行仍需在服务器执行。
+
 ### 从已有 SFT 做单组 350 步 RL 快速验证
 
 原 Office 实验在175步时已出现下降，可以先检查前350步，无需每次跑满1746步。这个实验用于观察早期退化是否减轻，不能证明完整训练有效或无效。下面只把RL学习率从原 `1e-5` 改为 `5e-6`，其他训练方法保持一致；这是参数适配实验，原官方配置入口不变，issue #5 本身没有给出已验证的修复参数。
