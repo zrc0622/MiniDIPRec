@@ -6,6 +6,49 @@
 
 补充 checkpoint 验证：收到服务器175/350/1575步评估后，五组共24330条验证预测核验通过。175步Recall@10已从SFT的0.232635降至0.211673，1400步仅恢复到0.213933；1400仍是本次四个RL checkpoint中NDCG@10最高者。现有证据更支持早期退化后未充分恢复，未证明具体原因。详细报告在 `results/qwen3_h50_seed42_rl16_fixed/Office_Products/diagnostics/checkpoint_analysis_20260911/report.md`；此次未改变训练方法或原模型选择。
 
+## 新五组实验：写入 results2，RL 均为 350 步
+
+在已运行旧六组的服务器上，同步本次新脚本和 `reproduction/upstream_minionerec/`，使用原训练环境，在仓库根目录执行：
+
+```bash
+python scripts/run_rl_five.py \
+  --run-name minionerec_five350 \
+  --source-suite results/qwen3_six350 \
+  --gpus 0,1,2,3
+```
+
+| 组 | 模型 / 数据 | SFT 来源 | RL 差异 |
+|---|---|---|---|
+| 01_history10_restart | Qwen3-0.6B / Office | 导入旧第六组 SFT10 step378 | 原第六组重跑，beta.04、确定性beam |
+| 02_history10_adamw | Qwen3-0.6B / Office | 同一导入 SFT10 | 仅将优化器改为 adamw_torch |
+| 03_official_qwen3_office | Qwen3-0.6B / Office | 从原始 Qwen3 重新 SFT | 官方自然任务配比、原始 RL prompt、beta.001、beam sampling |
+| 04_official_qwen25_office | Qwen2.5-0.5B Base / Office | 从原始 Qwen2.5 重新 SFT | 同第03组官方配方 |
+| 05_official_qwen25_industrial | Qwen2.5-0.5B Base / Industrial | 独立重新 SFT | 同第04组官方配方、更换数据集 |
+
+前三项旧方案的 FP32 概率计算、单任务 RL、CE 混合损失均未加入。五组都从自己的 SFT 初始化，不继承旧中断 RL 或上一组 RL；之后重复同命令才恢复本轮自身 checkpoint。SFT 采用原最多10epochs/验证loss最优/早停规则，**不限制350步**。
+
+结果固定在 `results2/minionerec_five350/`，权重默认在 `checkpoints/minionerec_five350/`。用 `--checkpoint-root /path/to/large_disk` 可更换权重父目录，禁止放进results/results2。旧 SFT10 权重必须仍在服务器；如果已经移动，可用 `--source-sft /new/path/selected_model`，脚本核验旧完成记录中的全部哈希。本地收到的压缩包不含权重，单有压缩包不能启动训练。旧六组目录只读，完成初始化后本轮可独立恢复。
+
+默认允许自动下载/使用缓存中的原始模型。可通过 `--qwen3-model /path/to/Qwen3-0.6B --qwen25-model /path/to/Qwen2.5-0.5B` 使用本地模型；已缓存且不希望联网时加 `--offline`。预检验证结构及SID词表扩展后的参数量严格小于1B，扫描所选实验的全部train/valid任务，提前拒绝截断和tokenizer不匹配。四卡编号可替换，SFT micro默认4、评估batch默认2。
+
+每组RL候选batch1024、G16、每更新64输入组，350步共22400组。保存并用完整valid评估50/100/175/350，SFT基线共4份，合计24份压缩预测。LR1e-5，完整两轮cosine/warmup3%不压缩成350步；reference间隔512。官方数据自然去重使总任务数不同：Office55290（38924/6366/10000），Industrial52775（36259/6516/10000）；各自完整scheduler为1728/1650、warmup52/50。旧history10配方仍55842、scheduler1746/warmup53。
+
+后三组是**官方配方经必要兼容适配后的350步短程复现**，不是未经修改的官方脚本或完整两轮结论。固定官方源码commit、原始数据构造和全部差异见 [upstream说明](reproduction/upstream_minionerec/README.md)。特别是官方RL保留未指定加载dtype的路径，并记录实际精度；官方去重/Fusion SID查表/原始RL提示词保留。奖励使用随行target避免官方train/valid字典覆盖，统一评估使用SFT推荐prompt和确定性beam50。第03与第01是配方整体对照，不作单因素归因。
+
+中断恢复、仅查看计划和打包：
+
+```bash
+bash results2/minionerec_five350/resume.sh
+python scripts/run_rl_five.py --dry-run
+python scripts/package_results2.py minionerec_five350
+```
+
+`--stage prepare/train/eval` 分别用于仅准备、仅训练、仅评估，默认all；`--experiments 1 2` 可只执行指定组，始终按数字顺序。任何失败停止后续训练；已完成阶段不重复执行，350步已完整保存但收尾中断时只补记录。checkpoint完整标记在各rank保存完成后写入，缺标记的半成品保留为隐藏 `.incomplete-*` 目录，恢复使用最近完整checkpoint。每次恢复清理回放区间的重复标量日志。
+
+`summary.md/.csv/.json` 汇总相对各自SFT的HR/NDCG变化，`status.json` 区分训练完成和评估完成。每个子进程只保留**256KiB控制台尾部＋64KiB警告尾部**；逐步标量完整保存，预测无损gzip后删除本轮未压缩副本，数据/源码共享。默认不开wandb、不写TensorBoard、不转储logits。打包入口使用同一文件锁，训练正在运行时拒绝打包，停止后的部分结果可打包并显示完成组数。输出为 `results2/minionerec_five350.tar.gz`，不会混入旧results或模型权重。
+
+本地28项定向测试通过（含单独补跑的真实Qwen3 tokenizer测试），最终五组入口8项回归通过；真实Qwen2.5 Base tokenizer在两类数据上的SFT标签/EOS/beam50验证通过。全量官方train/valid预检确认三组词表扩展后参数量约0.596B/0.494B/0.494B，均小于1B。验证记录在 `results2/five_validation_20260913/`；本机无CUDA和服务器SFT权重，尚未启动真实四卡实验。
+
 ## 安装与一键运行
 
 Linux、Python 3.11、4 张支持 BF16 的 NVIDIA GPU；建议从官方使用的 A100/H100 级设备开始。以下安装 CUDA 12.4 的 PyTorch 2.6 wheel，需匹配宿主驱动。命令均在仓库根目录执行。

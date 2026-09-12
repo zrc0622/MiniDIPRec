@@ -1,5 +1,29 @@
 # Experiment history
 
+## 2026-09-13 — 新五组串行 RL350：results2 与官方小模型配方
+
+按用户最终确认实现五组：01导入旧第六组已完成的SFT10 step378，重新运行原RL；02同一SFT10且仅改为adamw_torch；03原始Qwen3-0.6B/Office重新官方配方SFT+RL；04原始Qwen2.5-0.5B Base/Office重新SFT+RL；05同模型Industrial独立SFT+RL。所有RL均350次优化器更新，SFT仍为最多10epochs/验证loss选模/早停。未加入已否决的FP32概率计算、单任务或CE混合组。
+
+新增run_rl_five/train_rl_five/five_utils及package_results2入口；旧六组依赖21份源码哈希不变。固定官方commit 0c64b955ecb8e3d7a9ae9f1fa88cf938f129b0ed，保留原始history10 CSV、任务去重、Fusion查表、原始RL prompt及shuffle。官方三组采用beta.001、beam sampling、paged AdamW、未指定模型加载dtype；记录实际dtype，使用现有兼容ReReTrainer和随行奖励target避免train/valid字典覆盖。统一完整valid确定性beam50评估。此为必要适配后的350步短程复现，不是未经修改的官方执行，也不声称完整复现论文结果。
+
+候选batch1024/G16，每组22400输入组；50/100/175/350四快照，4个SFT基线共24份压缩预测。旧配方55842任务、完整调度1746/warmup53；官方Office55290任务（38924/6366/10000）、调度1728/warmup52；Industrial52775任务（36259/6516/10000）、调度1650/warmup50。均保留完整两轮cosine而在350停止，reference间隔512。
+
+结果仅写results2/minionerec_five350，权重在独立checkpoints目录。每个进程256KiB控制台尾部+64KiB警告尾部，保留完整逐步标量、gzip预测、共享数据与源码。串行失败停止；同命令恢复，已完成350checkpoint不多更新；完整保存标记与各rank barrier避免恢复半成品，半成品仅改名保留。打包与训练共用锁，只打包本轮results2，无旧results和权重。保留用户原summary.md和results.tar.gz。
+
+28项定向CPU测试通过（27项批量通过，原需tokenizer的1项单独补跑通过）；最后改动后五组入口8项再回归通过。真实tiny Qwen2采样RL及中断恢复后policy/reference/scheduler与连续训练一致；模拟GPU验证串行路由、独立SFT、失败停止、重复运行、预测压缩及打包。真实Qwen3和Qwen2.5 tokenizer beam50合法性通过；Qwen2.5两类别SFT屏蔽/EOS通过。三组全量官方train/valid长度扫描通过，词表扩展后参数596390912/494327552/494291712，全部小于1B。记录在results2/five_validation_20260913；本机无CUDA/服务器权重，未执行真实四卡训练、ZeRO2/bitsandbytes恢复或新推荐指标评估。
+
+## 2026-09-13 — 收到六组实验压缩包：五组 RL 未转正，第六组结果不完整
+
+将 `results.tar.gz` 的995个普通文件独立解压到 `results/received_20260913/`，未覆盖旧结果。新套件22次验证、107052条预测及历史C四个快照通过指标重算、标签/顺序/候选/哈希检查；37项共享产物、21个运行源码与当前代码相符。最终222项分析输入和原始压缩包哈希不变。
+
+SFT50 HR10/NDCG10为.232635/.188749。五组350步按LR5e-6、beta.1、batch128、等量任务、G32顺序为.225236/.184864、.225031/.182161、.228113/.185391、.220715/.178791、.224620/.183612，净Top10命中分别−36/−37/−22/−58/−39。全部20个新RL快照NDCG10低于SFT。按1795名用户做3000次配对bootstrap，五组350步NDCG10差值区间均低于0；batch128 HR10区间包含0，其余为负。区间未校正多重比较，不包含训练seed方差。相对历史C多数组缓解退化，但尚未超过SFT。
+
+history10数据逐行验证为三列历史同步取末10项，标签不变；SFT504步早停、选378，HR10.234073/NDCG10.189155，净+7命中且两项配对区间均包含0。其RL只有169条完整逐步记录，末尾400字节NUL，控制台含step170；没有RL完成记录和验证结果。31个命令启动、30个退出且均为0，最后是第六组RL。此包不能证明服务器当前状态，不将第六组判为失败，也不推断未保存checkpoint。
+
+LR/beta/G32同样本顺序、每更新64输入组，三者最大grad_norm均在179步，94～95步也有共同KL尖峰；值得追踪样本和逐token policy/reference概率，但未确定根因。G32提高推算有命中奖励组比例至41.5%，仍未转化为排名增益。小batch累计仅2800组、warmup424尚未结束，不能视为等样本预算的纯batch结论。history10已有KL559/grad232尖峰，但缺少排名结果。建议先补齐第六组，再做固定checkpoint的样本/数值诊断；本次未修改训练代码或启动实验。
+
+压缩包展开985.3MB，旧ABC/fixed/seed42合计840.5MB，占85.3%；新六组144.8MB，其中压缩预测84.93MB、共享数据/来源57.37MB、tail日志1.41MB。没有模型权重混入，日志限额生效；后续可仅打包 `qwen3_six350`。完整中文报告、可复查JSON/CSV、分析脚本、核验日志及已检查PNG/PDF在 `results/six_analysis_20260913/`。用户原始 `summary.md` 与压缩包保持不变。
+
 ## 2026-09-12 — 六组串行 RL350 与紧凑 results
 
 用户授权实现此前六组规划，并将所有RL预算统一改为350次优化器更新。新增独立 `scripts/run_rl_six.py`、`train_rl_six.py` 和 `six_utils.py`：LR5e-6、beta.1、batch128、三任务等量、G32、history10依次运行；其他设置以C（LR1e-5/beta.04/确定性beam/G16/batch1024）为基准。前五组共用SFT50，第六组从原始Qwen3重训SFT10，SFT沿用10epochs/验证loss选模/早停，随后RL350。每组保存50/100/175/350，用完整valid统一beam50评估；共用SFT50基线一次，SFT10独立基线一次，共26次评估。失败停止后续组；可重复命令恢复，最终350checkpoint存在时不额外更新，完成SFT后中断导出可从best checkpoint补齐。

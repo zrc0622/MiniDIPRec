@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/AkaliKong/MiniOneRec",
+  "commit": "0c64b955ecb8e3d7a9ae9f1fa88cf938f129b0ed",
+  "files": {
+    "data.py.txt": "58af8773f0a33ea79312cbb229c6f9b27db065019443992277a495c0c8d60869",
+    "sft.py.txt": "205979dcf7e18ed0f93b6cda28548c58068d8bebeb9209f39f1b2ca5b976fc43",
+    "rl.py.txt": "6536922cf36da030ee870e565b635a6b7dc208ed3c957fa500fdc69a67b9971b",
+    "minionerec_trainer.py.txt": "f25423905c2ee5135372db598875b65203506cffa5a566431288d6da2522f0f5",
+    "sft.sh.txt": "5ed8a6a4dc8447c8e7599a50d91c2e6b1209027d682996003afda2590b27cfda",
+    "rl.sh.txt": "a4b4d2b0432fd40fe7f8af595edab5ddd5594409c73e1f87b5ba1cde3eee8ab1",
+    "config__zero2_opt.yaml.txt": "008b81655cebfd984ea3255e9b55cca9218cfce91789d6d45fb3f4f620d499a3",
+    "requirements.txt.txt": "7390bc1ca7a1a6d7f01484e2adf200a5cd3fc328e63c2c4607a29b4e0cbea75f",
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  }
+}
