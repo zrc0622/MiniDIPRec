@@ -1,5 +1,29 @@
 # Experiment history
 
+## 2026-09-13 — 直接官方入口，Office / Industrial 各自 SFT + RL700
+
+用户授权改代码并git add，未授权本次commit/push或启动正式训练。新增`run_official_two.py`串行运行两类Qwen2.5-0.5B Base；各自重新SFT，再从本类选中的SFT启动RL700。直接调用固定官方commit `0c64b955ecb8e3d7a9ae9f1fa88cf938f129b0ed`的sft/rl/evaluate/calc入口，源码快照与每次运行的runtime.patch可审计。保留原数据去重/Fusion查表/奖励字典覆盖、原采样器、原约束解码及loss；不是前一轮适配trainer的重跑。
+
+保持候选batch1024/G16、LR1e-5、beta.001、beam sampling、原两轮cosine/warmup3%计划，以callback停止700。新增50/100/175/350/500/550/700快照，保留原定期保存和validation reward评估；500/550观察首次reference同步512前后。四卡训练、官方单卡beam50验证，共16份valid预测。SFT仍原最多10epochs/早停/验证loss选模。改动限于TRL缺失字段兼容、空token列表保护、移除ranking未使用模型加载、日志/导出和恢复；同步reference随checkpoint保存恢复。
+
+新结果位于results2/official_qwen25_two700，权重独立于results2。控制台每命令256KiB尾部、告警64KiB尾部，指标完整JSONL、预测gzip，关闭WandB；不重复保存最终RL权重。配置/源码/输入和阶段完成指纹约束恢复；完整700只补最终记录与评估，不追加训练。
+
+验证：7项单测通过，覆盖双组串行、失败停止、跳过已完成阶段、700完成恢复、预测压缩、源码不变、checkpoint校验和日志限额。真实Qwen2.5 tokenizer扫描两类全量官方数据均无截断，扩展后参数494327552/494291712。真实官方SFT/RL/evaluate/calc在随机小Qwen2上运行；G16生成合法、非零梯度，reference同步后中断恢复与连续训练的参数和reference逐项一致，beam50指标与官方calc一致，SFT最佳模型导出恢复通过。CPU测试调整预算/优化器及部分依赖导入，不代表CUDA/ZeRO2/bnb已验证。本机无CUDA，未执行两组正式训练。旧五组34份source SHA全部不变，6个新Python AST和27个README Bash块通过；验证记录位于results2/official_validation_20260913。
+
+## 2026-09-13 — 五组results2完成：Office仍负，Industrial仅早期小幅正向
+
+用户提供results2.zip及已解压套件。321项结果文件与ZIP逐字节一致，54共享产物、34份运行源码、全部24次验证/115114条预测通过完整覆盖、标签、候选、排序、指标及哈希核验。37条命令全部退出0，五组均完整350步并评估50/100/175/350，没有续训。旧第六组前169条训练标量与本轮01逐项相同，SFT10验证预测完全相同，确认完成原中断实验。
+
+350步Office四组按重跑H10/TorchAdamW/官方Qwen3/官方Qwen2.5顺序，HR10为.223798/.220304/.208590/.209823，各自SFT为.234073/.234073/.231813/.229552；NDCG10为.184012/.181661/.169321/.169931，各自SFT为.189155/.189155/.187742/.184765。净Top10命中−50/−67/−113/−96，按1795用户聚类配对bootstrap3000次，两项95%差值区间均负。
+
+01/02实际参数除输出路径外只差优化器，SFT及任务/顺序哈希一致。Torch使KL最大3968→180、grad_norm最大232→27.7，但350步NDCG10比01再低.002351，差值区间低于0；HR10净再少17，区间跨0。官方Qwen3最大KL107仍明显下降；降低日志尖峰不充分保证排名改善，也不能把问题只归因于Qwen3家族。
+
+Industrial官方Qwen2.5的SFT HR10/NDCG10=.152030/.112704，50步=.154457/.114506（净+11）；HR10差值区间跨0，NDCG10区间[.000296,.003254]为正，但未校正多步比较且仅一个seed。350步=.151809/.110354（净−1），HR10/NDCG10区间均跨0；HR50 .240512→.232127、区间负。只支持初步早期信号，不能宣布稳定正向。Office净损失来自目标不在末10项历史的样本；Industrial50冷商品净贡献+1，不能套用Enhanced大规模冷启动收益解释。
+
+官方dtype日志在trainer.train之前记录，reference已DeepSpeed准备而policy尚未准备，不能据FP32/BF16字段认定实际前向精度或完成FP32消融。所有350步均早于ref512，排除首次reference同步作为这段退化的触发。五组退出时DeepSpeed析构IndexError发生于完成后，后续结果核验通过。建议优先固定样本分任务/目标概率诊断与raw/SFT prompt现有checkpoint对照；若再训练优先复核Industrial早期多seed信号。未新增训练或改训练代码。
+
+套件176.81MB，预测92.01MB、共享数据/源码81.97MB、日志仅1.67MB，无模型权重且日志均符合限额。完整中文报告、配对统计、紧凑数据和PNG/PDF在results2/five_analysis_20260913；脚本只读输入。无本地checkpoint权重，未进行GPU推理或独立权重哈希复核；不将适配350步结果外推为官方完整两轮或Enhanced复现结论。
+
 ## 2026-09-13 — 新五组串行 RL350：results2 与官方小模型配方
 
 按用户最终确认实现五组：01导入旧第六组已完成的SFT10 step378，重新运行原RL；02同一SFT10且仅改为adamw_torch；03原始Qwen3-0.6B/Office重新官方配方SFT+RL；04原始Qwen2.5-0.5B Base/Office重新SFT+RL；05同模型Industrial独立SFT+RL。所有RL均350次优化器更新，SFT仍为最多10epochs/验证loss选模/早停。未加入已否决的FP32概率计算、单任务或CE混合组。

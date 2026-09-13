@@ -1,0 +1,5 @@
+# Additional imports in the direct upstream entrypoints. Linux/CUDA training.
+-r requirements-reproduction.txt
+fire==0.7.1
+wandb==0.22.2
+scikit-learn==1.7.2

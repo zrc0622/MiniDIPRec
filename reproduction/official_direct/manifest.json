@@ -1,0 +1,70 @@
+{
+  "repository": "https://github.com/AkaliKong/MiniOneRec",
+  "commit": "0c64b955ecb8e3d7a9ae9f1fa88cf938f129b0ed",
+  "files": {
+    "sft.py": {
+      "snapshot": "sft.py.txt",
+      "sha256": "205979dcf7e18ed0f93b6cda28548c58068d8bebeb9209f39f1b2ca5b976fc43"
+    },
+    "rl.py": {
+      "snapshot": "rl.py.txt",
+      "sha256": "6536922cf36da030ee870e565b635a6b7dc208ed3c957fa500fdc69a67b9971b"
+    },
+    "data.py": {
+      "snapshot": "data.py.txt",
+      "sha256": "58af8773f0a33ea79312cbb229c6f9b27db065019443992277a495c0c8d60869"
+    },
+    "minionerec_trainer.py": {
+      "snapshot": "minionerec_trainer.py.txt",
+      "sha256": "f25423905c2ee5135372db598875b65203506cffa5a566431288d6da2522f0f5"
+    },
+    "evaluate.py": {
+      "snapshot": "evaluate.py.txt",
+      "sha256": "ffb7736811dd60a7e2405f2c2baf7d3e30b06cc9d12bef574229649d53927757"
+    },
+    "LogitProcessor.py": {
+      "snapshot": "LogitProcessor.py.txt",
+      "sha256": "13ab33ff0ed3f769370478a86624499ccc0f8813de9d63e3dc4e2fa25ec59eb8"
+    },
+    "calc.py": {
+      "snapshot": "calc.py.txt",
+      "sha256": "3e5dc6bf10c2e23f50180f520993462c7756b717dd60d646d8b540274a3fce82"
+    },
+    "sasrec.py": {
+      "snapshot": "sasrec.py.txt",
+      "sha256": "05f0c85d1854f0c1ca41fb77b256db28a00f6b6c0127c3ab69236347ffe7cb69"
+    },
+    "SASRecModules_ori.py": {
+      "snapshot": "SASRecModules_ori.py.txt",
+      "sha256": "76ef521d9ad16dcf87f85f89604749103db6f087754a3210505bc22180a11bb3"
+    },
+    "utility.py": {
+      "snapshot": "utility.py.txt",
+      "sha256": "380115dd1e7abbb07b2a0b4e94f24e55786fc873907de3ecd02034f5b2faa1da"
+    },
+    "sft.sh": {
+      "snapshot": "sft.sh.txt",
+      "sha256": "5ed8a6a4dc8447c8e7599a50d91c2e6b1209027d682996003afda2590b27cfda"
+    },
+    "rl.sh": {
+      "snapshot": "rl.sh.txt",
+      "sha256": "a4b4d2b0432fd40fe7f8af595edab5ddd5594409c73e1f87b5ba1cde3eee8ab1"
+    },
+    "evaluate.sh": {
+      "snapshot": "evaluate.sh.txt",
+      "sha256": "87ea1f10d082fcaad060ca83a9e346c41421a8ecc8210ddac6d5db4bb30e1eb7"
+    },
+    "config/zero2_opt.yaml": {
+      "snapshot": "config__zero2_opt.yaml.txt",
+      "sha256": "008b81655cebfd984ea3255e9b55cca9218cfce91789d6d45fb3f4f620d499a3"
+    },
+    "requirements.txt": {
+      "snapshot": "requirements.txt.txt",
+      "sha256": "7390bc1ca7a1a6d7f01484e2adf200a5cd3fc328e63c2c4607a29b4e0cbea75f"
+    },
+    "LICENSE": {
+      "snapshot": "LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    }
+  }
+}

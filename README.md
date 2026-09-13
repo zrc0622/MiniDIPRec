@@ -6,7 +6,53 @@
 
 补充 checkpoint 验证：收到服务器175/350/1575步评估后，五组共24330条验证预测核验通过。175步Recall@10已从SFT的0.232635降至0.211673，1400步仅恢复到0.213933；1400仍是本次四个RL checkpoint中NDCG@10最高者。现有证据更支持早期退化后未充分恢复，未证明具体原因。详细报告在 `results/qwen3_h50_seed42_rl16_fixed/Office_Products/diagnostics/checkpoint_analysis_20260911/report.md`；此次未改变训练方法或原模型选择。
 
-## 新五组实验：写入 results2，RL 均为 350 步
+## 最新：直接调用官方实现，Office → Industrial，各自 SFT + RL700
+
+这轮使用固定官方源码的实际 `sft.py`、`rl.py`、`evaluate.py`、`calc.py` 入口。
+两组都从 **Qwen2.5-0.5B Base** 独立重新 SFT，再训练 RL 到700次优化器更新。
+原始 CSV 历史、三任务自然配比、奖励字典、采样器、约束解码和损失均保留。
+兼容、日志与保存方面的改动见 [源码说明](reproduction/official_direct/README.md)，每次运行另存准确的 `runtime.patch`。
+
+在服务器仓库根目录、原训练环境中执行（首次补齐官方入口依赖）：
+
+```bash
+python -m pip install -r requirements-official-direct.txt
+python scripts/run_official_two.py \
+  --run-name official_qwen25_two700 \
+  --model Qwen/Qwen2.5-0.5B \
+  --gpus 0,1,2,3
+```
+
+该命令串行完成 **Office SFT → SFT valid → RL700 → 七个 RL valid → Industrial 同一流程**。
+训练用四张卡，官方评估入口每次使用指定列表中的第一张卡，全部评估串行。
+无需手动 export；脚本设置 CUDA 可见卡、禁用 WandB 和 tokenizer 并行日志。
+本地基础模型可替换 `--model /path/to/Qwen2.5-0.5B`；已缓存时可加 `--offline`。
+先检查参数可加 `--dry-run`，只准备源代码/数据可加 `--stage prepare`。
+
+SFT 有效 batch1024，四卡 micro4 / accumulation64，最多10epochs，按官方验证loss和早停选模型。
+RL 四卡 micro16 / accumulation16，候选 batch1024、G16、每更新64组，LR1e-5、beta.001、
+beam sampling、paged_adamw_32bit。保留官方两轮 cosine/warmup3% 学习率计划，**没有把 max_steps 改成700**。
+保存并完整验证50/100/175/350/500/550/700，额外保留官方原有定期checkpoint；500/550跨越首次reference同步512。
+实际 scheduler、dtype、generation config 和上游来源写入每组记录。
+这轮只评 valid，共16份预测；每组与自己的新 SFT 比较，700步仍是官方完整训练的部分复现。
+
+结果在 `results2/official_qwen25_two700/`，权重在 `checkpoints/official_qwen25_two700/`。
+可用 `--checkpoint-root /path/to/large_disk` 指定权重父目录，禁止放进results/results2。
+每个进程命令仅保留256KiB控制台尾部和64KiB告警尾部；标量指标完整保留，预测保存为gzip，
+不复制重复的最终RL权重，不写WandB日志。checkpoint仍包含恢复所需的优化器和reference，权重目录会显著大于结果目录。
+
+中断后重复原命令，或执行结果目录中的 `resume.sh`。已完成阶段跳过；RL恢复时同时加载reference，
+避免跨512同步后换回初始reference。仅支持这两组700步以内、第一轮内恢复，配置和源文件发生变化会拒绝继续。
+损坏或未完成的checkpoint会隔离保留；完整checkpoint校验失败直接报错。任一步失败即停止，不继续下一组。
+训练停止后打包小结果目录：
+
+```bash
+python scripts/package_official_two.py official_qwen25_two700
+```
+
+本地已进行真实tokenizer全量数据预检和CPU测试；本机无CUDA，未启动这两组正式训练。
+
+## 前一轮五组实验：写入 results2，RL 均为 350 步
 
 在已运行旧六组的服务器上，同步本次新脚本和 `reproduction/upstream_minionerec/`，使用原训练环境，在仓库根目录执行：
 
