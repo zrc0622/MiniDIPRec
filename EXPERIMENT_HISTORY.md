@@ -1,5 +1,38 @@
 # Experiment history
 
+## 2026-09-14 — Qwen3-1.7B 当前 MiniOneRec 双数据集 RL350 实现
+
+用户授权将当前 MiniOneRec 换成 Qwen/Qwen3-1.7B，在 Office、Industrial 各自全新 SFT 后 RL350。
+新增 run_qwen3_two/train_qwen3_two/qwen3_two_utils/package_qwen3_two 和定向测试，保留旧训练器、数据类与旧入口源码。
+采用当前 H10 配方（对应五组01）：beta.04、确定性beam/G16、row-local奖励目标、推荐prompt三阶段对齐、自然三任务配比。
+不引入被否决的FP32、CE或单任务实验，不使用不存在的1.7B-Base模型名。
+
+默认SFT每卡micro2、累积128，最多10epochs、验证loss选模/早停；RL每卡micro16、累积16、候选batch1024，LR1e-5、paged AdamW。
+完整两轮cosine计划为Office1746步/warmup53、Industrial1676/51，仅执行前350步，保存25/50/100/175/350。
+两类独立四卡SFT/RL及四卡beam50 valid评估，共12份预测；不读取test。结果写results2/qwen3_1p7b_two350，权重写独立checkpoints目录。
+控制台每命令限256KiB、告警64KiB，标量完整、预测gzip，完成/恢复用哈希校验；最终350已保存时只补记录和评测。
+
+真实1.7B tokenizer全任务扫描通过：扩展参数Office1,721,256,960、Industrial1,721,175,040；SFT长度上限均256，RL1792/1152。
+RL任务数分别38924/6918/10000、36259/7372/10000；9398条valid的SFT/RL/评测prompt及mask/newline/EOS逐token核对通过。
+13项测试通过：8项新套件回归及5项共享运行路径验证。新worker用随机小Qwen3实际执行SFT/最佳导出和RL backward，
+checkpoint后中断恢复与连续训练的policy/reference/scheduler逐项一致，标量回放不重复；真实tokenizer+完整Office catalog确定性beam50通过。
+CPU验证替换硬件限制、模型规模、数据和预算，采用FP32/Torch AdamW；不代表CUDA/ZeRO2/bitsandbytes或1.7B显存已验证。
+验证产物位于results2/qwen3_two_validation_20260914。本次未启动正式实验、未git add/commit/push，保留已有results2.zip及历史分析。
+
+## 2026-09-14 — 直接官方 RL700：Office 退化，Industrial 早期正向，发现评测口径差异
+
+分析更新后的results2.zip，仅解压新官方套件237项；旧五组321项与已有文件相同。30份源码指纹、23条完成命令、两组各700条训练标量通过核验；16次valid评测共75184条预测逐条重算一致，均为合法、无重复候选。没有新训练、test评测或生产代码修改。
+
+Office SFT→50→350→700的HR10为.215988→.216605→.198931→.193383，NDCG10为.168700→.169569→.155785→.151615；700净少110个Top10命中，两指标相对下降10.47%/10.13%。Industrial对应HR10为.124228→.132171→.124228→.127538，NDCG10为.088657→.092919→.088229→.091905。Industrial50净多36个命中、相对提升6.39%/4.81%，按用户聚类5000次bootstrap并对本轮7checkpoint×2主要指标构造同时95%区间后仍为正；700两指标区间跨零，HR50相对下降7.96%。50步新增55个Top10命中全部来自原11–50名；700约88.4%的NDCG增量来自占5.2%的历史重复商品样本，不能概括为广泛冷启动改善。
+
+重要更正：Industrial本轮与前五组SFT的权重SHA、tokenizer.json和数值训练日志完全相同，但SFT HR10从.152030变为.124228。因此不能解释为本轮SFT训练变差。逐行调用官方数据类证实，上轮评测prompt与官方SFT相同，本轮EvalSidDataset的User Input不同，RL又省略外层instruction；先前“官方评测与SFT对齐”的说法不准确。config/generation_config/tokenizer_config哈希和评测封装也有差别，尚不能将全部差距归因于prompt一项。本次prompt检查使用无损字符编码器，仅核验文本，不声称重新运行真实tokenizer或模型。
+
+长度表述也更正：SFT及推荐评测无截断，但归档实际tokenizer扫描显示RL商品标题/描述prompt最长Office1699、Industrial1078，超过trainer512上限，会保留最后512tokens。preflight只校验RL不超过模型上下文，不代表全部训练prompt无截断。官方任务直接拼接，RL任务量分别38924/6366/10000与36259/6516/10000，并非1:1:1；原共享奖励字典目标不一致行为保留。
+
+两组prepare后实际BF16，候选batch1024/G16，保留1728/1650步cosine计划并在700停止。KL峰值约7.37e5/3.16e6，与梯度峰值不在同一步；reference512同步后KL中位数下降，但排名未持续普遍恢复，缺少对照不能作因果判断。训练四卡、独立评测仅GPU0，每次约10–11分钟，能解释评测阶段仅卡0占用。新套件70.98MB，其中控制台日志3.37MB；ZIP包含旧五组，不是新增巨量日志。
+
+建议优先用已有SFT/RL50/350/700固定解码器比较三种prompt，再决定早期多seed验证或任务/奖励诊断。完整报告、可复现脚本、统计、曲线和输入SHA位于`results2/official_analysis_20260914/`；输入解压至`results2/received_20260914/official_qwen25_two700/`。本次不git add/commit/push。
+
 ## 2026-09-13 — 直接官方入口，Office / Industrial 各自 SFT + RL700
 
 用户授权改代码并git add，未授权本次commit/push或启动正式训练。新增`run_official_two.py`串行运行两类Qwen2.5-0.5B Base；各自重新SFT，再从本类选中的SFT启动RL700。直接调用固定官方commit `0c64b955ecb8e3d7a9ae9f1fa88cf938f129b0ed`的sft/rl/evaluate/calc入口，源码快照与每次运行的runtime.patch可审计。保留原数据去重/Fusion查表/奖励字典覆盖、原采样器、原约束解码及loss；不是前一轮适配trainer的重跑。

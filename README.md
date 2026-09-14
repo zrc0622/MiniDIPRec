@@ -6,7 +6,62 @@
 
 补充 checkpoint 验证：收到服务器175/350/1575步评估后，五组共24330条验证预测核验通过。175步Recall@10已从SFT的0.232635降至0.211673，1400步仅恢复到0.213933；1400仍是本次四个RL checkpoint中NDCG@10最高者。现有证据更支持早期退化后未充分恢复，未证明具体原因。详细报告在 `results/qwen3_h50_seed42_rl16_fixed/Office_Products/diagnostics/checkpoint_analysis_20260911/report.md`；此次未改变训练方法或原模型选择。
 
-## 最新：直接调用官方实现，Office → Industrial，各自 SFT + RL700
+## 最新：Qwen3-1.7B，当前 MiniOneRec，Office → Industrial，各自 SFT + RL350
+
+在服务器的仓库根目录、已安装 `requirements-reproduction.txt` 的训练环境中执行：
+
+```bash
+python scripts/run_qwen3_two.py \
+  --run-name qwen3_1p7b_two350 \
+  --model Qwen/Qwen3-1.7B \
+  --gpus 0,1,2,3
+```
+
+串行顺序为 **Office 全新 SFT → SFT valid → RL350 → 五个 RL valid → Industrial 同一流程**。
+两类均从原始 `Qwen/Qwen3-1.7B` 独立开始，无需旧 SFT/checkpoint。使用 Qwen3 标准模型；
+不要填写不存在的 `Qwen3-1.7B-Base`。无需手动 export，脚本设置可见卡和日志环境。
+可替换为 `--model /path/to/Qwen3-1.7B`；模型已缓存时可加 `--offline`。
+
+本轮使用**我们当前的 H10 配方**：当前数据类/训练器、SFT/RL/评测对齐的推荐 prompt、
+随行 reward target、三任务自然拼接、beta **0.04**、确定性 beam、G16、LR1e-5、paged_adamw_32bit。
+对应上轮五组中的 `01_history10_restart`；与直接官方700步实验相比，模型、prompt及配方均有差异，
+不能将两轮指标差异全部归因于参数量。三任务不是1:1:1；每类新 RL 只与自己的 SFT 基线比较。
+
+SFT 最多10epochs、LR3e-4、warmup20，按验证loss最优和patience3早停选模，不限350步。
+默认四卡每卡 micro2、累积128，有效 batch1024。RL 四卡每卡 micro16、累积16，
+候选 batch1024，每次更新64个输入组；350步共22400组。保留完整两轮 cosine/warmup3%计划，
+Office horizon1746/warmup53、Industrial1676/51，在350步停止，不把学习率计划压缩到350步。
+保存 **25/50/100/175/350**，完成 RL 后依次完整评估所有快照，reference同步间隔仍512。
+
+**SFT、RL和独立评测都使用四张指定卡**。评测为确定性beam50、每卡batch1，只用valid，
+共12份压缩预测。SFT micro可用 `--sft-micro-batch` 调整为256的约数，评测可用
+`--eval-batch-size`；RL micro16保持完整G16分组。GPU显存峰值尚未实测。
+
+结果：`results2/qwen3_1p7b_two350/`；权重：`checkpoints/qwen3_1p7b_two350/`。
+可用 `--checkpoint-root /path/to/large_disk` 指定权重父目录，禁止放入results/results2。
+每条子进程命令仅保存256KiB控制台尾部和64KiB告警尾部；完整标量JSONL、预测gzip、共享数据/源码。
+不开WandB、不保存logits、不重复复制最终RL模型。恢复用的优化器/reference留在checkpoint目录。
+
+```bash
+# 中断后恢复：跳过已完成阶段，恢复本轮自己的完整checkpoint
+bash results2/qwen3_1p7b_two350/resume.sh
+# 查看计划，不下载、不写入
+python scripts/run_qwen3_two.py --dry-run
+# 完成或停止后，只打包本轮小结果目录
+python scripts/package_qwen3_two.py qwen3_1p7b_two350
+```
+
+重复原始启动命令也可恢复；配置/源码发生变化会拒绝覆盖。任一阶段失败即停止，
+不会继续下一数据集。`--stage prepare/train/eval` 分别只准备共享数据/源码、训练、评估；
+`--experiments 1` 或 `2` 可单独执行对应数据集，默认两组。生成的resume.sh默认继续完整两组。
+汇总见 `summary.md/.csv/.json`，完成状态见 `status.json`；打包输出
+`results2/qwen3_1p7b_two350.tar.gz`。
+
+本地13项定向测试通过，包括新worker的真实小模型SFT、RL backward、checkpoint/reference恢复逐项一致，
+以及真实1.7B tokenizer的beam50检查。全量数据扫描通过，两类共9398条valid的prompt/标签逐token对齐；
+验证记录在 `results2/qwen3_two_validation_20260914/`。本机无CUDA，未启动1.7B正式训练或测量显存。
+
+## 前一轮：直接调用官方实现，Office → Industrial，各自 SFT + RL700
 
 这轮使用固定官方源码的实际 `sft.py`、`rl.py`、`evaluate.py`、`calc.py` 入口。
 两组都从 **Qwen2.5-0.5B Base** 独立重新 SFT，再训练 RL 到700次优化器更新。
